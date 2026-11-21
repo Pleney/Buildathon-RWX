@@ -47,14 +47,16 @@ DEFAULT_CONFIG: dict[str, float] = {
     "p_direct": 1.0,
     # Enclosing multi-line statement of a changed line (e.g. short-circuited branch)
     "p_enclosing_stmt": 0.90,
-    # Enclosing function hit when changed line itself WAS covered by some test
-    "p_enclosing_func": 0.12,
-    # Enclosing function hit when changed line had ZERO direct line coverage
-    "p_enclosing_func_uncovered": 0.85,
+    # Other tests in enclosing function that did NOT reach the changed statement
+    # (when function signature, decorators, and local scope bindings are unchanged)
+    "p_enclosing_func": 0.0,
+    # Enclosing function hit when statement had zero direct/enclosing-stmt coverage
+    # (0.0 when provably unreachable & scope-preserving; >0 for extra conservatism)
+    "p_dead_stmt_func": 0.0,
     # Class attribute / dialect table: tests intersecting dialect AND attr reader
     "p_dialect_attr_intersect": 0.90,
     # Class attribute / dialect table: other tests using the dialect (non-intersecting)
-    "p_dialect_attr_fallback": 0.015,
+    "p_dialect_attr_fallback": 0.0,
     # Expression class attribute: tests instantiating/referencing the Expr subclass
     "p_expr_attr": 0.90,
     # Module-level var/constant: functions referencing the changed variable
@@ -62,7 +64,6 @@ DEFAULT_CONFIG: dict[str, float] = {
     # Broad module/importer fallback when change is localized weakly
     "p_module_fallback": 0.05,
     # Pure AST-identical Python comment/whitespace change (verified by encoding + ast.dump)
-    # 0.0 -> skip AST-identical files; >0.0 -> include cheap tests up to p*300 sec
     "p_ast_identical": 0.0,
     # Assumed effective parallelism divisor k for FR4 marginal cost check
     "fr4_k_divisor": 1.0,
@@ -150,9 +151,11 @@ class BlastRadiusSelector:
         self.test_file_expr_refs: dict[str, list[str]] = self.m.get("test_file_expr_refs", {})
         self.base_sources: dict[str, bytes] = self.m["base_sources"]
 
-        # Cache decompressed base sources & AST statement spans on demand
+        # Cache decompressed base sources & AST metadata on demand
         self._src_cache: dict[str, bytes] = {}
         self._stmt_spans_cache: dict[str, list[tuple[int, int]]] = {}
+        self._lambda_spans_cache: dict[str, list[tuple[int, int]]] = {}
+        self._func_node_cache: dict[str, dict[str, ast.AST]] = {}
 
         # Precompute reverse index: identifier name -> bitset of tests executing
         # any function in sqlglot/ that references that name
@@ -217,47 +220,145 @@ class BlastRadiusSelector:
         self._src_cache[rel] = raw
         return raw
 
-    def _get_stmt_spans(self, rel: str) -> list[tuple[int, int]]:
-        cached = self._stmt_spans_cache.get(rel)
-        if cached is not None:
-            return cached
+    def _ensure_ast_caches(self, rel: str) -> None:
+        if rel in self._stmt_spans_cache:
+            return
         raw = self._get_base_source(rel)
-        if raw is None:
-            return []
         spans: list[tuple[int, int]] = []
-        try:
-            tree = ast.parse(raw)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.stmt) and not isinstance(
-                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-                ):
-                    s = getattr(node, "lineno", None)
-                    e = getattr(node, "end_lineno", None)
-                    if s is not None and e is not None:
-                        spans.append((s, e))
-        except Exception:
-            pass
+        lambdas: list[tuple[int, int]] = []
+        fnodes: dict[str, ast.AST] = {}
+        if raw is not None:
+            try:
+                tree = ast.parse(raw)
+                scope: list[str] = []
+
+                def walk_defs(body: list[ast.stmt]) -> None:
+                    for st in body:
+                        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            qn = ".".join((*scope, st.name))
+                            fnodes[qn] = st
+                            scope.append(st.name)
+                            walk_defs(st.body)
+                            scope.pop()
+                        elif isinstance(st, ast.ClassDef):
+                            scope.append(st.name)
+                            walk_defs(st.body)
+                            scope.pop()
+
+                walk_defs(tree.body)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.stmt) and not isinstance(
+                        node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                    ):
+                        s = getattr(node, "lineno", None)
+                        e = getattr(node, "end_lineno", None)
+                        if s is not None and e is not None:
+                            spans.append((s, e))
+                    elif isinstance(node, ast.Lambda):
+                        s = getattr(node, "lineno", None)
+                        e = getattr(node, "end_lineno", None)
+                        if s is not None and e is not None:
+                            lambdas.append((s, e))
+            except Exception:
+                pass
         self._stmt_spans_cache[rel] = spans
-        return spans
+        self._lambda_spans_cache[rel] = lambdas
+        self._func_node_cache[rel] = fnodes
 
     def _enclosing_stmt_lines(self, rel: str, lineno: int) -> tuple[int, int] | None:
         """Find the narrowest non-def/non-class statement span containing lineno."""
+        self._ensure_ast_caches(rel)
         best: tuple[int, int] | None = None
-        for s, e in self._get_stmt_spans(rel):
+        for s, e in self._stmt_spans_cache[rel]:
             if s <= lineno <= e:
                 if best is None or (e - s) < (best[1] - best[0]):
                     best = (s, e)
         return best
 
-    def _tests_referencing_name(self, name: str) -> int:
-        cached = self._name_ref_tests_cache.get(name)
+    def _line_in_lambda(self, rel: str, lineno: int) -> bool:
+        self._ensure_ast_caches(rel)
+        return any(s <= lineno <= e for s, e in self._lambda_spans_cache[rel])
+
+    @staticmethod
+    def _func_scope_signature(node: ast.AST) -> tuple[str, str, frozenset[str], bool]:
+        """Extract compile-time properties of a function that affect the whole body:
+        arguments/defaults, decorators, locally bound names, and generator/yield flag."""
+        assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        args_dump = ast.dump(node.args, include_attributes=False)
+        decs_dump = "|".join(ast.dump(d, include_attributes=False) for d in node.decorator_list)
+        bound: set[str] = set()
+        has_yield = False
+        # Walk only this function's own scope (do not descend into nested def/class)
+        stack: list[ast.AST] = list(node.body)
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                bound.add(cur.name)
+                continue
+            if isinstance(cur, ast.ClassDef):
+                bound.add(cur.name)
+                continue
+            if isinstance(cur, (ast.Yield, ast.YieldFrom)):
+                has_yield = True
+            elif isinstance(cur, (ast.Global, ast.Nonlocal)):
+                bound.update(cur.names)
+            elif isinstance(cur, ast.Name) and isinstance(cur.ctx, (ast.Store, ast.Del)):
+                bound.add(cur.id)
+            elif isinstance(cur, ast.ExceptHandler) and cur.name:
+                bound.add(cur.name)
+            elif isinstance(cur, (ast.Import, ast.ImportFrom)):
+                for a in cur.names:
+                    bound.add(a.asname or a.name.split(".")[0])
+            stack.extend(ast.iter_child_nodes(cur))
+        return (args_dump, decs_dump, frozenset(bound), has_yield)
+
+    def _func_scope_changed(self, rel: str, fq: str, new_tree: ast.AST | None) -> bool:
+        """Return True if signature, decorators, local bindings, or yield-ness changed."""
+        if new_tree is None:
+            return True
+        self._ensure_ast_caches(rel)
+        old_node = self._func_node_cache[rel].get(fq)
+        if old_node is None:
+            return True
+        # Locate matching qualname in new_tree
+        parts = fq.split(".")
+        cur_body: list[ast.stmt] = getattr(new_tree, "body", [])
+        new_node: ast.AST | None = None
+        for idx, part in enumerate(parts):
+            found = None
+            for st in cur_body:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and st.name == part:
+                    found = st
+                    break
+            if found is None:
+                return True
+            if idx == len(parts) - 1:
+                new_node = found
+            else:
+                cur_body = getattr(found, "body", [])
+        if not isinstance(new_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return True
+        return self._func_scope_signature(old_node) != self._func_scope_signature(new_node)
+
+    def _tests_referencing_name(self, name: str, *, skip_plumbing_ctors: bool = False) -> int:
+        cache_key = (name, skip_plumbing_ctors)
+        cached = self._name_ref_tests_cache.get(cache_key)
         if cached is not None:
             return cached
-        bits = 0
+        runtime_bits = 0
+        ctor_bits = 0
         for rel, qn in self._name_to_locations.get(name, ()):
-            bits |= self.func_to_tests.get(rel, {}).get(qn, 0)
-            bits |= self.class_to_tests.get(rel, {}).get(qn, 0)
-        self._name_ref_tests_cache[name] = bits
+            # Only runtime functions/methods (exclude class-body definitions which are writes)
+            fb = self.func_to_tests.get(rel, {}).get(qn, 0)
+            if not fb:
+                continue
+            short = qn.rsplit(".", 1)[-1]
+            if skip_plumbing_ctors and short in ("__init__", "__new__", "_init_core"):
+                ctor_bits |= fb
+            else:
+                runtime_bits |= fb
+        bits = runtime_bits if runtime_bits else ctor_bits
+        self._name_ref_tests_cache[cache_key] = bits
         return bits
 
     def _importer_tests(self, rel: str) -> int:
@@ -288,18 +389,26 @@ class BlastRadiusSelector:
         return bits
 
     def _expr_hierarchy_tests(self, rel: str, cls_qname: str) -> int:
-        """All tests instantiating or statically referencing an Expr class or its subclasses."""
+        """All tests instantiating or method-referencing an Expr class or its subclasses."""
+        def _method_refs_for(expr_name: str) -> int:
+            rbits = 0
+            for tref in self.test_file_expr_refs.get(expr_name, ()):
+                qns = self.ast_index.get(tref, {}).get("names_referenced_by", {}).get(expr_name, ())
+                mbits = self._test_method_bits.get(tref, {})
+                matched = 0
+                for qn in qns:
+                    if qn in mbits:
+                        matched |= mbits[qn]
+                rbits |= matched if matched else self.test_file_to_tests.get(tref, 0)
+            return rbits
+
         short = cls_qname.split(".")[-1]
-        bits = self.expr_to_tests.get(short, 0)
-        for tref in self.test_file_expr_refs.get(short, ()):
-            bits |= self.test_file_to_tests.get(tref, 0)
+        bits = self.expr_to_tests.get(short, 0) | _method_refs_for(short)
         cls_id = f"{rel}:{cls_qname}"
         for sub_id in self.class_subclasses.get(cls_id, ()):
             sub_q = sub_id.split(":", 1)[1]
             sub_short = sub_q.split(".")[-1]
-            bits |= self.expr_to_tests.get(sub_short, 0)
-            for tref in self.test_file_expr_refs.get(sub_short, ()):
-                bits |= self.test_file_to_tests.get(tref, 0)
+            bits |= self.expr_to_tests.get(sub_short, 0) | _method_refs_for(sub_short)
         return bits
 
     def _add_prob(self, probs: dict[int, float], bitset: int, p: float) -> None:
@@ -398,10 +507,17 @@ class BlastRadiusSelector:
         file_fmap = self.func_to_tests.get(rel, {})
         ast_funcs = self.ast_index.get(rel, {}).get("funcs", [])
         func_spans = {qn: (s, e) for s, e, qn in ast_funcs}
+        new_tree: ast.AST | None = None
+        if ana.changed_funcs:
+            try:
+                new_tree = ast.parse(new_bytes)
+            except Exception:
+                new_tree = None
 
         for fq in ana.changed_funcs:
             ftests = file_fmap.get(fq, 0)
             span = func_spans.get(fq)
+            scope_changed = self._func_scope_changed(rel, fq, new_tree)
 
             # Collect lines belonging to this function that were touched
             fn_changed_lines = (
@@ -420,49 +536,70 @@ class BlastRadiusSelector:
                     for sln in range(st_span[0], st_span[1] + 1):
                         enclosing_stmt_bits |= file_lmap.get(sln, 0)
 
+            if scope_changed:
+                # Signature, decorator, local variable binding, or yield-ness changed:
+                # whole function must be treated as directly impacted
+                if ftests:
+                    self._add_prob(probs, ftests, cfg["p_direct"])
+                else:
+                    top_cls = fq.split(".")[0] if "." in fq else ""
+                    fallback_bits = self._subclass_dialect_tests(rel, top_cls) if top_cls else 0
+                    fallback_bits |= self._tests_referencing_name(fq.split(".")[-1])
+                    if not fallback_bits:
+                        fallback_bits = self.module_exec_tests.get(rel, 0) | self.dialect_to_tests.get(rel, 0)
+                    self._add_prob(probs, fallback_bits if fallback_bits else self.all_map_bits, cfg["p_direct"])
+                continue
+
             if direct_line_bits:
                 self._add_prob(probs, direct_line_bits, cfg["p_direct"])
                 if enclosing_stmt_bits:
                     self._add_prob(probs, enclosing_stmt_bits, cfg["p_enclosing_stmt"])
-                if ftests:
+                if ftests and cfg["p_enclosing_func"] > 0.0:
                     self._add_prob(probs, ftests, cfg["p_enclosing_func"])
             elif enclosing_stmt_bits:
                 self._add_prob(probs, enclosing_stmt_bits, cfg["p_direct"])
-                if ftests:
-                    self._add_prob(probs, ftests, cfg["p_enclosing_func_uncovered"])
+                if ftests and cfg["p_enclosing_func"] > 0.0:
+                    self._add_prob(probs, ftests, cfg["p_enclosing_func"])
             elif ftests:
-                # Line wasn't directly executed (e.g. dead branch or newly added line),
-                # so promote all tests executing this function
-                self._add_prob(probs, ftests, cfg["p_enclosing_func_uncovered"])
+                # Zero tests executed the changed line OR its enclosing statement, AND
+                # compile-time function scope/signature/decorators are unchanged:
+                # the edited statement is dynamically unreachable under the test suite.
+                if cfg["p_dead_stmt_func"] > 0.0:
+                    self._add_prob(probs, ftests, cfg["p_dead_stmt_func"])
             else:
-                # Function never executed directly (e.g. nested closure/builder returned at
-                # import time or a newly added method/override)
-                top_cls = fq.split(".")[0] if "." in fq else ""
-                fallback_bits = 0
-                if top_cls:
-                    fallback_bits |= self._subclass_dialect_tests(rel, top_cls)
-                    if rel.startswith("sqlglot/expressions/"):
-                        fallback_bits |= self._expr_hierarchy_tests(rel, top_cls)
-                # Also check callers referencing the function name
-                short_fn = fq.split(".")[-1]
-                fallback_bits |= self._tests_referencing_name(short_fn)
-                if not fallback_bits:
-                    fallback_bits = self.module_exec_tests.get(rel, 0) | self.dialect_to_tests.get(rel, 0)
-                self._add_prob(probs, fallback_bits if fallback_bits else self.all_map_bits, cfg["p_direct"])
+                # Function itself was never executed directly (e.g. closure builder or new method)
+                # Check if any nested function inside this function was executed!
+                nested_bits = 0
+                prefix_dot = fq + "."
+                for other_q, obits in file_fmap.items():
+                    if other_q.startswith(prefix_dot):
+                        nested_bits |= obits
+                if nested_bits:
+                    self._add_prob(probs, nested_bits, cfg["p_direct"])
+                else:
+                    top_cls = fq.split(".")[0] if "." in fq else ""
+                    fallback_bits = 0
+                    if top_cls:
+                        fallback_bits |= self._subclass_dialect_tests(rel, top_cls)
+                        if rel.startswith("sqlglot/expressions/"):
+                            fallback_bits |= self._expr_hierarchy_tests(rel, top_cls)
+                    fallback_bits |= self._tests_referencing_name(fq.split(".")[-1])
+                    if not fallback_bits:
+                        fallback_bits = self.module_exec_tests.get(rel, 0) | self.dialect_to_tests.get(rel, 0)
+                    self._add_prob(probs, fallback_bits if fallback_bits else self.all_map_bits, cfg["p_direct"])
 
         # 7. Class attribute / declarative table changes (e.g. FUNCTIONS, SHOW_PARSERS,
         #    NUMERIC_ESCAPES, WEEK_OFFSET, arg_types, TRANSFORMS, KEYWORDS)
         for cq, attr_name, dkeys in ana.changed_class_attrs:
-            # First check if changed lines inside this class attribute had direct runtime
-            # coverage (e.g. a lambda inside FUNCTIONS / TRANSFORMS dict)
+            # Only treat direct line coverage as a runtime hit when the changed line is
+            # inside a lambda (avoiding accidental lazy-import first-test hits on class bodies!)
             direct_attr_lines = 0
             for ln in changed_lines:
-                direct_attr_lines |= file_lmap.get(ln, 0)
+                if self._line_in_lambda(rel, ln):
+                    direct_attr_lines |= file_lmap.get(ln, 0)
 
             if direct_attr_lines:
-                # The edited dict entry is a runtime-executed lambda/expression!
                 self._add_prob(probs, direct_attr_lines, cfg["p_direct"])
-                # Also add a small safety margin on the dialect's cheap tests
                 dial_bits = self._subclass_dialect_tests(rel, cq)
                 if dial_bits:
                     self._add_prob(probs, dial_bits, cfg["p_dialect_attr_fallback"])
@@ -491,7 +628,10 @@ class BlastRadiusSelector:
 
             # Dialect / Parser / Generator / Tokenizer class attribute
             dial_bits = self._subclass_dialect_tests(rel, cq)
-            ref_bits = self._tests_referencing_name(attr_name)
+            ref_bits = self._tests_referencing_name(attr_name, skip_plumbing_ctors=True)
+            if attr_name.isupper():
+                # Check lowercase mirror (e.g. TokenizerCore.numeric_escapes <- NUMERIC_ESCAPES)
+                ref_bits |= self._tests_referencing_name(attr_name.lower(), skip_plumbing_ctors=True)
 
             # If dict keys are Expr class names (e.g. TRANSFORMS = {exp.Foo: ...}),
             # we can intersect even more tightly with expr_to_tests!

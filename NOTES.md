@@ -121,6 +121,33 @@
   - Classic LPT-suboptimal `[5000, 4000, 3000, 3000, 3000]` -> optimal `[9000, 9000]` (k=2).
   - Full 1,620-test suite -> optimal `k=4`, `max_load=28.817s` (equals single longest test), cost `36.817s` (vs starter's `40.349s`), packed in **1.95 ms**.
 
+---
+
+## Phase 6: Evaluation, Principled Refinements & Cross-Validation (`eval.py`)
+
+### Principled Program-Analysis Refinements
+1. **Runtime readers vs class-body definitions**: `_tests_referencing_name` now queries `func_to_tests` only (excluding class-body definitions, which are writes) and skips pure plumbing constructors (`__init__`, `__new__`, `_init_core`) when non-constructor reader methods exist (also checking `attr.lower()` for `TokenizerCore` mirrors). This narrowed `TSQL.WEEK_OFFSET` from 170 tests to 10 tests (+0.271 s over oracle) and `SingleStoreParser.SHOW_PARSERS` from 37 tests to 1 test.
+2. **Lambda-only direct line hits for class attributes**: Class attribute assignments only use `line_to_tests` when the changed line is inside an `ast.Lambda`, preventing accidental first-import test hits from bypassing dialect-attribute reader intersection.
+3. **Compile-time function scope + statement reachability**: When a function's signature, decorators, local variable bindings, and generator/yield status are unchanged, tests that never reached the modified line or its enclosing statement cannot be affected (eliminating unrelated enclosing-function bloat and dynamically unreachable statements).
+4. **Method-level `Expr` static references**: Narrowed static `Expr` references in `tests/` from whole-file to the referencing test methods (reducing `TriggerProperties.arg_types` from 76 tests to 4 tests).
+
+### Sample Evaluation & 3-Fold (20/10) Cross-Validation
+| Metric | Value |
+|---|---|
+| Simulated time (30 samples) | **165.365 s** (7.3x reduction vs 1210.470 s baseline) |
+| Oracle lower bound (30 samples) | **94.351 s** |
+| Excess across all 18 failing commits | **+0.501 s total** (20/30 commits at exact `+0.000 s` oracle!) |
+| Excess on 8 covered 0-fail commits | **+70.513 s** (`2haz` 25.45s, `66ks` 24.79s, `4d63` 9.02s, `2qn5` 2.54s, `5y72` 2.47s, `fryt` 2.16s, `ktz3` 2.09s, `gbav` 2.00s) |
+| Misses | **0 / 30** |
+| 3-fold CV aggregate (20 train / 10 val) | **165.365 s**, **0 misses**, **0.000 s CV gap** (all 3 folds select identical config) |
+| Total local CPU (load + 30 commits) | **0.609 s** (map load 0.047 s + selection/packing 0.562 s) |
+
+### Key Architectural Finding: Pure-Static Lower Bound vs Practice Target (142.9 s)
+- On 30 samples, **+70.5 s** of excess comes strictly from **covered-but-non-failing code edits** (notably `is None` vs `== None` in `context.py` and `is Enum` vs `== Enum` in `dialect.py`, both directly executed by 21.45 s `test_execute_tpcds`, plus 6 other covered edits where 0 tests fail).
+- Even a theoretically perfect pure-static line-coverage selector (without running tests at decision time) has a hard floor of **~160 s** on 30 samples (**~213 s** scaled to 40 practice commits), whereas the #1 practice score is **142.9 s** (~107 s on 30-commit scale).
+- Because PRD FR7 specifies stdlib-only / no sqlglot import / no pytest at decision time, this implementation strictly obeys FR7. Reaching `< 142.9 s` on practice requires relaxing FR7 to selectively run fast candidate tests in-container (explicitly permitted by `README.md`: "Running sqlglot's tests while you decide is allowed, and you pay for the time") so passing zero-fail commits emit `"workers": []` and passing fast canaries down-weight 21.5 s `test_execute_tpcds`.
+
+
 
 
 
