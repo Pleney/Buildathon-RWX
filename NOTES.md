@@ -170,3 +170,21 @@
 | Projected 40-commit practice score | 206.7 s (actual) | **~125–133 s** (target < 142.9 s) | — |
 | Robustness suite (local & in-Docker) | 18/18 passed | **18/18 passed** | — |
 
+---
+
+## Branch `hybrid-v3-econ`: Measurement, Economic Gate, Deadline Guard & Differential Audit
+
+### Step 1: Baseline Economic Measurement (`econ_report.py`, no behaviour change)
+Measured inside the exact scorer container (`--cpus 2 --read-only --user 65534:65534 --network none`) on commit `9a38b9b`:
+- **Total static cost**: `162.412 s`
+- **Total final simulated cost**: `94.581 s` (`0` misses)
+- **Total verifier CPU**: `10.904 s` (Grand CPU: `11.973 s`; 3-run median baseline total: **`107.094 s`**)
+- **Total saving**: `+67.831 s` | **Total net gain**: `+56.927 s`
+- **Profitable commits (8)**: `+60.175 s` net gain
+- **Money-losing verified commits (8)**: `-3.248 s` net (`3.519 s` CPU burned)
+  - Main loss patterns identified (purely structural, zero sample-specific logic):
+    1. Commits where unrunnable slow tests (`> max_single_test_sec`) remain and the runnable tests' marginal saving (`pack(S) - pack(S \ runnable)`) is smaller than their estimated CPU cost (fork + import + test execution).
+    2. `TestOptimizer` fixture tests run single-threaded under `_SyncExecutor` (so actual CPU is ~2x their multi-core recorded `tests.json` duration), making marginal pruning unprofitable unless eliminating the 2.00 s worker startup cost or probing shadow equivalence.
+    3. Commits where a `fixture` file is also modified alongside code (high probability of failure, low marginal saving).
+
+

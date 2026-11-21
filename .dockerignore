@@ -4,6 +4,8 @@ sample
 output.jsonl
 tests
 eval.py
+econ_report.py
+diff_test.py
 build_map.py
 NOTES.md
 SCORING.md
