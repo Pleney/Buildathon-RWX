@@ -781,6 +781,70 @@ def generate_synthetic_edits(sqlglot_root: Path, map_data: dict[str, Any]) -> li
         'def _camel_to_snake_case_renamed(name: str) -> str:\n    """Converts `name` from camelCase to snake_case and returns the result."""\n    return CAMEL_CASE_PATTERN.sub("_", name).upper()',
     )
 
+    # --- Phase 4 Quick-Set Stress Cases (ranges, const-equality sets, default args) ---
+    # 17a. Ordered comparison integer threshold shift (`len(args) > 3` -> `> 4`)
+    add(
+        "p4_range_postgres_args_gt",
+        "p4_range_const_default",
+        "sqlglot/parsers/postgres.py",
+        "    if len(args) > 3:",
+        "    if len(args) > 4:",
+    )
+
+    # 17b. Ordered comparison integer threshold shift (`> 4` -> `> 5` in diff.py)
+    add(
+        "p4_range_diff_leaves_gt",
+        "p4_range_const_default",
+        "sqlglot/diff.py",
+        "adjusted_t = self.t if min(source_leaves_num, target_leaves_num) > 4 else 0.4",
+        "adjusted_t = self.t if min(source_leaves_num, target_leaves_num) > 5 else 0.4",
+    )
+
+    # 17c. Constant-equality str swap (`unit == "WEEK"` -> `"ZZZ_WEEK"`)
+    add(
+        "p4_const_mysql_unit_week",
+        "p4_range_const_default",
+        "sqlglot/generators/mysql.py",
+        '    if unit == "WEEK":',
+        '    if unit == "ZZZ_WEEK":',
+    )
+
+    # 17d. Constant-equality str swap (`expression.name == "PROFILE"` -> `"ZZZ_PROFILE"`)
+    add(
+        "p4_const_mysql_show_profile",
+        "p4_range_const_default",
+        "sqlglot/generators/mysql.py",
+        '        if expression.name == "PROFILE":',
+        '        if expression.name == "ZZZ_PROFILE":',
+    )
+
+    # 17e. Constant-equality TokenType swap (`== TokenType.L_PAREN` -> `== TokenType.R_PAREN`)
+    add(
+        "p4_const_tokentype_swap",
+        "p4_range_const_default",
+        "sqlglot/anonymize.py",
+        "and tokens[i + 1].token_type == TokenType.L_PAREN",
+        "and tokens[i + 1].token_type == TokenType.R_PAREN",
+    )
+
+    # 17f. Default-argument edit on anonymize(dialect=None -> "postgres")
+    add(
+        "p4_default_arg_anonymize_dialect",
+        "p4_range_const_default",
+        "sqlglot/anonymize.py",
+        "    dialect: DialectType = None,",
+        '    dialect: DialectType = "postgres",',
+    )
+
+    # 17g. Non-pure import-time-crashing default argument trap (`imports=True` -> `1 / 0`)
+    add(
+        "p4_default_arg_nonpure_crash_trap",
+        "p4_range_const_default",
+        "sqlglot/lineage.py",
+        "        imports: bool = True,",
+        "        imports: bool = 1 / 0,",
+    )
+
     return edits
 
 

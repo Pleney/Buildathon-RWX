@@ -207,6 +207,11 @@ class BlastRadiusSelector:
         self.reach_profiles: dict[str, dict[tuple[int, ...], int]] = self.m.get("reach_profiles", {})
         self.mapping_profiles: dict[tuple[str, str], dict[str, Any]] = self.m.get("mapping_profiles", {})
         self.defined_dict_tables: frozenset[tuple[str, str]] = frozenset(self.m.get("defined_dict_tables", ()))
+        self.range_profiles: dict[str, dict[tuple[int, ...], Any]] = self.m.get("range_profiles", {})
+        self.const_profiles: dict[str, dict[tuple[int, ...], Any]] = self.m.get("const_profiles", {})
+        self.default_arg_profiles: dict[tuple[str, str], tuple[frozenset[str], dict[str, int]]] = self.m.get(
+            "default_arg_profiles", {}
+        )
         self.import_time_funcs: dict[str, set[str]] = {
             k: set(v) for k, v in self.m.get("import_time_funcs", {}).items()
         }
@@ -805,7 +810,38 @@ class BlastRadiusSelector:
 
             if scope_changed:
                 # Signature, decorator, local variable binding, or yield-ness changed:
-                # whole function must be treated as directly impacted
+                # whole function must be treated as directly impacted — EXCEPT Phase 4c:
+                # if ONLY pure default argument value(s) changed on a profiled undecorated
+                # function, keep only tests whose own profile used one of the changed defaults.
+                if (
+                    ftests
+                    and self.use_expr_profiles
+                    and self.enable_p4_ranges
+                    and self.default_arg_profiles
+                    and _expr_profiler_mod is not None
+                    and ana.old_tree is not None
+                    and new_tree is not None
+                    and not rel.startswith("sqlglot/typing/")
+                ):
+                    def_prof = self.default_arg_profiles.get((rel, fq))
+                    if def_prof is not None:
+                        old_fn = pp._find_node_by_qualname(ana.old_tree, fq)
+                        new_fn = pp._find_node_by_qualname(new_tree, fq)
+                        if old_fn is not None and new_fn is not None:
+                            changed_def_params = _expr_profiler_mod.find_default_only_param_edits(
+                                old_fn, new_fn, ana.old_tree
+                            )
+                            if changed_def_params:
+                                imp_params, pmap = def_prof
+                                if not any(p in imp_params for p in changed_def_params):
+                                    used_bits = self._unprofiled_test_bits
+                                    for p in changed_def_params:
+                                        used_bits |= pmap.get(p, 0)
+                                    narrowed = ftests & used_bits
+                                    if narrowed:
+                                        self._add_prob(probs, narrowed, cfg["p_direct"])
+                                    continue
+
                 if ftests:
                     self._add_prob(probs, ftests, cfg["p_direct"])
                 else:
@@ -1302,6 +1338,9 @@ class BlastRadiusSelector:
                         unprofiled_test_bits=self._unprofiled_test_bits,
                         enable_reach=self.enable_p1_reach,
                         enable_multisite=self.enable_p1_multisite,
+                        file_range_profiles=self.range_profiles.get(rel_p),
+                        file_const_profiles=self.const_profiles.get(rel_p),
+                        enable_p4_ranges=self.enable_p4_ranges,
                     )
                     if proven:
                         for idx in _iter_set_bits(proven):
