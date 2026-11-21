@@ -35,14 +35,21 @@ if str(APP_DIR) not in sys.path:
 
 import build_map as bm  # noqa: E402
 import expr_profiler as ep  # noqa: E402
+import mapping_profiler as mp  # noqa: E402
 
 
 class _ProfilePlugin:
-    """Pytest plugin recording per-test expression & reachability profiles in plain pytest order."""
+    """Pytest plugin recording per-test expression, reachability & mapping profiles in plain pytest order."""
 
-    def __init__(self, repo_root: Path, recorder: ep.BuildTimeProfileRecorder) -> None:
+    def __init__(
+        self,
+        repo_root: Path,
+        recorder: ep.BuildTimeProfileRecorder,
+        mapping_recorder: mp.MappingProfileRecorder,
+    ) -> None:
         self.repo_root = repo_root.resolve()
         self.recorder = recorder
+        self.mapping_recorder = mapping_recorder
         self.active_key: Any = None
         self.test_nodeids: list[str] = []
         self.test_classes: dict[str, str] = {}
@@ -64,12 +71,24 @@ class _ProfilePlugin:
                     pass
         return sys.monitoring.DISABLE
 
+    def _post_exec_hook(self, module: Any, rel: str) -> None:
+        mp.install_mapping_hooks(module, rel, self.mapping_recorder, track_keywords=True)
+
     def pytest_configure(self, config: Any) -> None:
         concurrent.futures.ProcessPoolExecutor = bm._SyncExecutor  # type: ignore[misc]
         builtins.__blast_bp__ = self.recorder.branch_probe  # type: ignore[attr-defined]
         builtins.__blast_cp__ = self.recorder.compare_probe  # type: ignore[attr-defined]
         builtins.__blast_rm__ = self.recorder.reach_mark  # type: ignore[attr-defined]
-        sys.meta_path.insert(0, ep.ProfilingMetaPathFinder(self.repo_root, self.recorder, enable_reach=True))
+        sys.meta_path.insert(
+            0,
+            ep.ProfilingMetaPathFinder(
+                self.repo_root,
+                self.recorder,
+                enable_reach=True,
+                mapping_recorder=self.mapping_recorder,
+                post_exec_hook=self._post_exec_hook,
+            ),
+        )
         # Capture functions executed during module import / collection (turned off once tests start!)
         try:
             sys.monitoring.use_tool_id(self._tool_id, "blast_prof_import")
@@ -103,25 +122,30 @@ class _ProfilePlugin:
             prev_key = self.active_key
             self.active_key = ("class", ckey)
             self.recorder.switch_target(self.active_key)
+            self.mapping_recorder.switch_target(self.active_key)
             try:
                 yield
             finally:
                 self.active_key = prev_key
                 self.recorder.switch_target(prev_key)
+                self.mapping_recorder.switch_target(prev_key)
         else:
             yield
 
     def pytest_runtest_setup(self, item: Any) -> None:
         self.active_key = item.nodeid
         self.recorder.switch_target(item.nodeid)
+        self.mapping_recorder.switch_target(item.nodeid)
 
     def pytest_runtest_call(self, item: Any) -> None:
         if self.active_key != item.nodeid:
             self.active_key = item.nodeid
             self.recorder.switch_target(item.nodeid)
+            self.mapping_recorder.switch_target(item.nodeid)
 
     def pytest_runtest_teardown(self, item: Any, nextitem: Any) -> None:
         self.recorder.stop()
+        self.mapping_recorder.stop()
         self.active_key = None
 
     def pytest_runtest_makereport(self, item: Any, call: Any) -> None:
@@ -133,6 +157,7 @@ class _ProfilePlugin:
 
     def pytest_sessionfinish(self, session: Any, exitstatus: int) -> None:
         self.recorder.stop()
+        self.mapping_recorder.stop()
         self.active_key = None
 
 
@@ -149,7 +174,8 @@ def run_single_pass(sqlglot_dir: Path, map_path: Path, run_out: Path) -> None:
     os.chdir(sqlglot_dir)
 
     recorder = ep.BuildTimeProfileRecorder()
-    plugin = _ProfilePlugin(sqlglot_dir, recorder)
+    mapping_recorder = mp.MappingProfileRecorder(expr_recorder=recorder)
+    plugin = _ProfilePlugin(sqlglot_dir, recorder, mapping_recorder)
     _ProfilePlugin.pytest_fixture_setup = pytest.hookimpl(hookwrapper=True)(
         _ProfilePlugin.pytest_fixture_setup
     )
@@ -179,6 +205,18 @@ def run_single_pass(sqlglot_dir: Path, map_path: Path, run_out: Path) -> None:
         if ck in recorder.reach_records:
             rdst = recorder.reach_records.setdefault(nid, set())
             rdst.update(recorder.reach_records[ck])
+        if ck in mapping_recorder.val_records:
+            mdst = mapping_recorder.val_records.setdefault(nid, {})
+            for tid, kset in mapping_recorder.val_records[ck].items():
+                mdst.setdefault(tid, set()).update(kset)
+        if ck in mapping_recorder.has_records:
+            hdst = mapping_recorder.has_records.setdefault(nid, {})
+            for tid, kset in mapping_recorder.has_records[ck].items():
+                hdst.setdefault(tid, set()).update(kset)
+        if ck in mapping_recorder.flag_records:
+            fdst = mapping_recorder.flag_records.setdefault(nid, {})
+            for tid, fl in mapping_recorder.flag_records[ck].items():
+                fdst[tid] = fdst.get(tid, 0) | fl
 
     # Pack into bitsets keyed by full 4-tuple span (rel, ln, col, eln, ecol)
     inactive_expr = {
@@ -266,6 +304,113 @@ def run_single_pass(sqlglot_dir: Path, map_path: Path, run_out: Path) -> None:
         if key not in inactive_reach and key not in reach_profiles:
             reach_profiles[key] = 0
 
+    # Pack mapping_profiles per table (cls_id, attr_name)
+    num_tables = len(mapping_recorder.tables)
+    tbl_val_bits: list[dict[Any, int]] = [{} for _ in range(num_tables)]
+    tbl_has_bits: list[dict[Any, int]] = [{} for _ in range(num_tables)]
+    tbl_len_bits: list[int] = [0] * num_tables
+    tbl_bool_bits: list[int] = [0] * num_tables
+    tbl_whole_bits: list[int] = [0] * num_tables
+
+    for nid, tid_map in mapping_recorder.val_records.items():
+        if not isinstance(nid, str):
+            continue
+        idx = id_to_idx.get(nid)
+        if idx is None:
+            continue
+        bit = 1 << idx
+        for tid, kset in tid_map.items():
+            d = tbl_val_bits[tid]
+            for tk in kset:
+                d[tk] = d.get(tk, 0) | bit
+
+    for nid, tid_map in mapping_recorder.has_records.items():
+        if not isinstance(nid, str):
+            continue
+        idx = id_to_idx.get(nid)
+        if idx is None:
+            continue
+        bit = 1 << idx
+        for tid, kset in tid_map.items():
+            d = tbl_has_bits[tid]
+            for tk in kset:
+                d[tk] = d.get(tk, 0) | bit
+
+    for nid, tid_map in mapping_recorder.flag_records.items():
+        if not isinstance(nid, str):
+            continue
+        idx = id_to_idx.get(nid)
+        if idx is None:
+            continue
+        bit = 1 << idx
+        for tid, fl in tid_map.items():
+            if fl & mp.FLAG_LEN:
+                tbl_len_bits[tid] |= bit
+            if fl & mp.FLAG_BOOL:
+                tbl_bool_bits[tid] |= bit
+            if fl & mp.FLAG_WHOLESALE:
+                tbl_whole_bits[tid] |= bit
+
+    import_subscripts = mp.scan_import_time_dict_subscripts(sqlglot_dir)
+    mapping_profiles: dict[tuple[str, str], dict[str, Any]] = {}
+    miss_overflow_tables = 0
+    for tid, tkey in enumerate(mapping_recorder.tables):
+        _cid, attr_name = tkey
+        base_keys = mapping_recorder.table_base_keys[tid]
+        track_misses = mapping_recorder.table_track_misses[tid]
+        vmap = tbl_val_bits[tid]
+        hmap = tbl_has_bits[tid]
+
+        miss_overflow = False
+        if track_misses:
+            miss_keys = (set(vmap.keys()) | set(hmap.keys())) - base_keys
+            if len(miss_keys) > mp.MAX_MISS_KEYS_PER_TABLE:
+                miss_overflow = True
+                miss_overflow_tables += 1
+                vmap = {k: b for k, b in vmap.items() if k in base_keys}
+                hmap = {k: b for k, b in hmap.items() if k in base_keys}
+        elif attr_name in mp.KEYS_DERIVED_ATTRS or attr_name == mp.TIME_MAPPING_ATTR:
+            # Values-only tables only ever query hits on base_keys and never need has_keys
+            vmap = {k: b for k, b in vmap.items() if k in base_keys}
+            hmap = {}
+
+        entry: dict[str, Any] = {}
+        if vmap:
+            entry["val_keys"] = vmap
+        if hmap:
+            entry["has_keys"] = hmap
+        if tbl_len_bits[tid]:
+            entry["len"] = tbl_len_bits[tid]
+        if tbl_bool_bits[tid]:
+            entry["bool"] = tbl_bool_bits[tid]
+        if tbl_whole_bits[tid]:
+            entry["wholesale"] = tbl_whole_bits[tid]
+        iv = set(mapping_recorder.import_val_keys.get(tid, ()))
+        imp_whole = tid in mapping_recorder.import_wholesale
+        for stk in import_subscripts.get(attr_name, ()):
+            if stk is None:
+                imp_whole = True
+            else:
+                iv.add(stk)
+        if iv:
+            entry["import_val_keys"] = frozenset(iv)
+        ih = mapping_recorder.import_has_keys.get(tid)
+        if ih:
+            entry["import_has_keys"] = frozenset(ih)
+        if imp_whole:
+            entry["import_wholesale"] = True
+        if miss_overflow:
+            entry["miss_overflow"] = True
+        aliases = mapping_recorder.table_aliases.get(tid)
+        if aliases:
+            entry["aliases"] = tuple(sorted(aliases))
+            for akey in aliases:
+                mapping_profiles[akey] = {"alias_of": tkey}
+
+        mapping_profiles[tkey] = entry
+
+    defined_dict_tables = mp.scan_defined_dict_tables(sqlglot_dir)
+
     active_collected = [n for n in plugin.test_nodeids if n not in plugin.skipped_nodeids]
     missing_from_run = sorted(set(test_ids) - set(active_collected))
 
@@ -275,6 +420,8 @@ def run_single_pass(sqlglot_dir: Path, map_path: Path, run_out: Path) -> None:
         "inactive_expr": inactive_expr,
         "inactive_reach": inactive_reach,
         "import_time_funcs": import_time_funcs,
+        "mapping_profiles": mapping_profiles,
+        "defined_dict_tables": defined_dict_tables,
         "missing_from_run": missing_from_run,
         "elapsed": elapsed,
     }
@@ -282,7 +429,8 @@ def run_single_pass(sqlglot_dir: Path, map_path: Path, run_out: Path) -> None:
     print(
         f"[build_profiles] wrote {run_out}: expr_sites={len(expr_profiles)} "
         f"(inactive={len(inactive_expr)}), reach_sites={len(reach_profiles)} "
-        f"(inactive={len(inactive_reach)}), missing_tests={len(missing_from_run)}",
+        f"(inactive={len(inactive_reach)}), mapping_tables={len(mapping_profiles)} "
+        f"(miss_overflow={miss_overflow_tables}), missing_tests={len(missing_from_run)}",
         file=sys.stderr,
         flush=True,
     )
@@ -320,6 +468,20 @@ def merge_and_check_stability(map_path: Path, run1_path: Path, run2_path: Path, 
         else:
             unstable_reach.append(key)
 
+    mp1 = r1.get("mapping_profiles", {})
+    mp2 = r2.get("mapping_profiles", {})
+    stable_mappings: dict[tuple[str, str], dict[str, Any]] = {}
+    unstable_mappings: list[tuple[str, str]] = []
+    for key in sorted(set(mp1.keys()) | set(mp2.keys())):
+        if key in mp1 and key in mp2 and mp1[key] == mp2[key]:
+            stable_mappings[key] = mp1[key]
+        else:
+            unstable_mappings.append(key)
+
+    defined_dict_tables = frozenset(
+        r1.get("defined_dict_tables", set()) | r2.get("defined_dict_tables", set())
+    )
+
     import_funcs_by_file: dict[str, list[str]] = defaultdict(list)
     for rel, qn in sorted(r1.get("import_time_funcs", set()) | r2.get("import_time_funcs", set())):
         import_funcs_by_file[rel].append(qn)
@@ -331,11 +493,13 @@ def merge_and_check_stability(map_path: Path, run1_path: Path, run2_path: Path, 
     )
 
     payload = {
-        "version": 3,
+        "version": 4,
         "commit": map_data["commit"],
         "test_ids": map_data["test_ids"],
         "expr_profiles": {k: dict(v) for k, v in stable_expr.items()},
         "reach_profiles": {k: dict(v) for k, v in stable_reach.items()},
+        "mapping_profiles": stable_mappings,
+        "defined_dict_tables": defined_dict_tables,
         "import_time_funcs": dict(import_funcs_by_file),
         "unprofiled_test_ids": unprofiled,
     }
@@ -346,11 +510,15 @@ def merge_and_check_stability(map_path: Path, run1_path: Path, run2_path: Path, 
 
     n_expr = sum(len(v) for v in stable_expr.values())
     n_reach = sum(len(v) for v in stable_reach.values())
+    mp_raw = len(pickle.dumps(stable_mappings, protocol=4))
+    mp_comp = len(zlib.compress(pickle.dumps(stable_mappings, protocol=4), level=9))
     print(
         f"[build_profiles] STABILITY DIFF COMPLETE:\n"
         f"  Run 1: {r1['elapsed']:.1f}s | Run 2: {r2['elapsed']:.1f}s\n"
-        f"  Expr sites:  {n_expr} stable, {len(unstable_expr)} unstable (dropped), {len(inact_expr)} import-time (excluded)\n"
-        f"  Reach sites: {n_reach} stable, {len(unstable_reach)} unstable (dropped), {len(inact_reach)} import-time (excluded)\n"
+        f"  Expr sites:     {n_expr} stable, {len(unstable_expr)} unstable (dropped), {len(inact_expr)} import-time (excluded)\n"
+        f"  Reach sites:    {n_reach} stable, {len(unstable_reach)} unstable (dropped), {len(inact_reach)} import-time (excluded)\n"
+        f"  Mapping tables: {len(stable_mappings)} stable, {len(unstable_mappings)} unstable (dropped) "
+        f"(sub-size {mp_comp/1e6:.2f} MB comp / {mp_raw/1e6:.2f} MB raw)\n"
         f"  Unprofiled tests: {unprofiled}\n"
         f"  profiles.pkl.gz: {len(comp)/1e6:.2f} MB compressed ({len(raw)/1e6:.2f} MB raw)",
         file=sys.stderr,
@@ -360,6 +528,8 @@ def merge_and_check_stability(map_path: Path, run1_path: Path, run2_path: Path, 
         print(f"  Sample unstable expr sites: {unstable_expr[:10]}", file=sys.stderr)
     if unstable_reach:
         print(f"  Sample unstable reach sites: {unstable_reach[:10]}", file=sys.stderr)
+    if unstable_mappings:
+        print(f"  Sample unstable mapping tables: {unstable_mappings[:10]}", file=sys.stderr)
 
 
 def main() -> None:

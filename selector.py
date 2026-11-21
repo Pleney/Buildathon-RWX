@@ -37,6 +37,11 @@ try:
 except ImportError:
     _expr_profiler_mod = None  # type: ignore[assignment]
 
+try:
+    import mapping_profiler as _mapping_profiler_mod  # noqa: E402
+except ImportError:
+    _mapping_profiler_mod = None  # type: ignore[assignment]
+
 _verifier_mod: Any = None
 
 DATA_DIR = Path("/data")
@@ -200,6 +205,8 @@ class BlastRadiusSelector:
         self.base_sources: dict[str, bytes] = self.m["base_sources"]
         self.expr_profiles: dict[str, dict[tuple[int, ...], tuple[int, ...]]] = self.m.get("expr_profiles", {})
         self.reach_profiles: dict[str, dict[tuple[int, ...], int]] = self.m.get("reach_profiles", {})
+        self.mapping_profiles: dict[tuple[str, str], dict[str, Any]] = self.m.get("mapping_profiles", {})
+        self.defined_dict_tables: frozenset[tuple[str, str]] = frozenset(self.m.get("defined_dict_tables", ()))
         self.import_time_funcs: dict[str, set[str]] = {
             k: set(v) for k, v in self.m.get("import_time_funcs", {}).items()
         }
@@ -221,6 +228,7 @@ class BlastRadiusSelector:
         # (rel, old_tree, new_tree, file_probs, scope_clean)
         self._last_commit_source_trees: list[tuple[str, ast.AST, ast.AST, dict[int, float], bool]] = []
         self._src_cache: dict[str, bytes] = {}
+        self._mod_ast_cache: dict[str, ast.AST | None] = {}
         self._stmt_spans_cache: dict[str, list[tuple[int, int]]] = {}
         self._lambda_spans_cache: dict[str, list[tuple[int, int]]] = {}
         self._func_node_cache: dict[str, dict[str, ast.AST]] = {}
@@ -287,6 +295,21 @@ class BlastRadiusSelector:
         raw = zlib.decompress(comp)
         self._src_cache[rel] = raw
         return raw
+
+    def _get_module_ast(self, mod_name: str) -> ast.AST | None:
+        if mod_name in self._mod_ast_cache:
+            return self._mod_ast_cache[mod_name]
+        rel = self.module_to_file.get(mod_name)
+        tree: ast.AST | None = None
+        if rel:
+            raw = self._get_base_source(rel)
+            if raw is not None:
+                try:
+                    tree = ast.parse(raw)
+                except Exception:
+                    tree = None
+        self._mod_ast_cache[mod_name] = tree
+        return tree
 
     def _ensure_ast_caches(self, rel: str, pre_parsed: ast.AST | None = None) -> None:
         if rel in self._stmt_spans_cache:
@@ -824,18 +847,52 @@ class BlastRadiusSelector:
 
             if dial_bits:
                 if expr_key_bits and (dial_bits & expr_key_bits):
-                    self._add_prob(probs, dial_bits & expr_key_bits, cfg["p_dialect_attr_intersect"])
-                    self._add_prob(probs, dial_bits, cfg["p_dialect_attr_fallback"])
+                    primary_bits, primary_p = dial_bits & expr_key_bits, cfg["p_dialect_attr_intersect"]
+                    fallback_bits, fallback_p = dial_bits, cfg["p_dialect_attr_fallback"]
                 elif ref_bits and (dial_bits & ref_bits):
-                    self._add_prob(probs, dial_bits & ref_bits, cfg["p_dialect_attr_intersect"])
-                    self._add_prob(probs, dial_bits, cfg["p_dialect_attr_fallback"])
+                    primary_bits, primary_p = dial_bits & ref_bits, cfg["p_dialect_attr_intersect"]
+                    fallback_bits, fallback_p = dial_bits, cfg["p_dialect_attr_fallback"]
                 else:
-                    self._add_prob(probs, dial_bits, cfg["p_dialect_attr_intersect"])
+                    primary_bits, primary_p = dial_bits, cfg["p_dialect_attr_intersect"]
+                    fallback_bits, fallback_p = 0, 0.0
             elif ref_bits:
-                self._add_prob(probs, ref_bits, cfg["p_module_var_ref"])
+                primary_bits, primary_p = ref_bits, cfg["p_module_var_ref"]
+                fallback_bits, fallback_p = 0, 0.0
             else:
                 fb = self.module_exec_tests.get(rel, 0)
-                self._add_prob(probs, fb if fb else self.all_map_bits, cfg["p_module_fallback"])
+                primary_bits, primary_p = (fb if fb else self.all_map_bits), cfg["p_module_fallback"]
+                fallback_bits, fallback_p = 0, 0.0
+
+            # Phase 2: Build-time per-test mapping-key lookup prover
+            if (
+                self.use_expr_profiles
+                and self.enable_p2_mappings
+                and _mapping_profiler_mod is not None
+                and self.mapping_profiles
+                and ana.old_tree is not None
+                and ana.new_tree is not None
+            ):
+                cand_attr_bits = primary_bits | fallback_bits
+                if cand_attr_bits:
+                    proven = _mapping_profiler_mod.prove_unchanged_for_class_dict(
+                        rel,
+                        cq,
+                        attr_name,
+                        ana.old_tree,
+                        ana.new_tree,
+                        cand_attr_bits,
+                        class_subclasses=self.class_subclasses,
+                        mapping_profiles=self.mapping_profiles,
+                        defined_dict_tables=self.defined_dict_tables,
+                        unprofiled_test_bits=self._unprofiled_test_bits,
+                        resolve_module_tree=self._get_module_ast,
+                    )
+                    if proven:
+                        primary_bits &= ~proven
+                        fallback_bits &= ~proven
+
+            self._add_prob(probs, primary_bits, primary_p)
+            self._add_prob(probs, fallback_bits, fallback_p)
 
         # 8. Module-level variable / constant changes (e.g. EXPRESSION_METADATA, constants)
         for var_name, dkeys in ana.changed_module_vars:
@@ -1290,6 +1347,7 @@ def load_map(
                 "import_time_funcs",
                 "unprofiled_test_ids",
                 "mapping_profiles",
+                "defined_dict_tables",
                 "range_profiles",
                 "const_profiles",
                 "default_arg_profiles",
@@ -1303,6 +1361,7 @@ def load_map(
                 "import_time_funcs",
                 "unprofiled_test_ids",
                 "mapping_profiles",
+                "defined_dict_tables",
                 "range_profiles",
                 "const_profiles",
                 "default_arg_profiles",
