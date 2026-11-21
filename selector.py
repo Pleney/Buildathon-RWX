@@ -147,7 +147,7 @@ class BlastRadiusSelector:
         if os.environ.get("BLAST_DISABLE_VERIFIER", "0") == "1":
             self.verifier_mode: str = "off"
         else:
-            self.verifier_mode = os.environ.get("BLAST_VERIFIER_MODE", "single_cheap").strip().lower()
+            self.verifier_mode = os.environ.get("BLAST_VERIFIER_MODE", "off").strip().lower()
         self.single_cheap_max_sec: float = float(os.environ.get("BLAST_SINGLE_CHEAP_MAX_SEC", "0.15"))
 
         self.verifier: Any = None

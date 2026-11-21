@@ -246,10 +246,11 @@ Added explicit verifier mode control (`BLAST_VERIFIER_MODE=off|single_cheap|full
 | (b) Static + dict-values filter (`profiles=OFF, verifier=off`) | 162.412 s | 1.091 s | **163.503 s** | 0 | -2.599 s |
 | (b+) Static + dict-values + `single_cheap` (`profiles=OFF`) | 160.408 s | 1.511 s | **161.919 s** | 0 | -4.183 s (+1.584 s over `off`) |
 | (c) Full v3 (`07f2971`, `profiles=OFF, verifier=full, shadow=OFF`) | 144.822 s | 9.452 s | **154.274 s** | 0 | -11.828 s (207.4 s on practice) |
-| (d) Static + dict-values + **test-specific profiles** (`verifier=off`) | **109.635 s** | **1.214 s** | **110.849 s** | 0 | **-55.253 s** (-52.654 s vs (b)) |
-| (e) Static + dict-values + **test-specific profiles** + **`single_cheap`** (default) | **107.631 s** | **1.611 s** | **109.242 s** | 0 | **-56.860 s** (+1.607 s over (d)) |
+| (d) Static + dict-values + **test-specific profiles** (`verifier=off`, **safe default**) | **109.635 s** | **1.214 s** | **110.849 s** | 0 | **-55.253 s** (-52.654 s vs (b)) |
+| (e) Static + dict-values + **test-specific profiles** + **`single_cheap`** (opt-in) | **107.631 s** | **1.611 s** | **109.242 s** | 0 | **-56.860 s** (+1.607 s over (d)) |
 
-- **Single-cheap-test trick (`single_cheap`)**: Runs ONLY when a commit selects exactly 1 non-fixture test with `dur_sec <= 0.15 s` outside heavy-dependency files (`tests/test_optimizer.py`, `tests/test_executor.py`, avoiding ~1 s `duckdb`/`pandas` import cost). Payoff is ~10:1 (`~0.20 s` CPU to eliminate a `2.00 s` worker startup cost); net gain is strictly positive (**`+1.607 s`** with profiles, **`+1.584 s`** without profiles), so `single_cheap` is kept as default with `BLAST_VERIFIER_MODE=off` / `BLAST_DISABLE_VERIFIER=1` available to disable it completely.
+- **Safe default**: `BLAST_VERIFIER_MODE` defaults to `off` (configuration (d)) so `verifier.py` is not imported at runtime unless explicitly enabled (`BLAST_VERIFIER_MODE=single_cheap` or `full`). Shadow and Laplace unrun-test pruning remain disabled (`False`).
+- **Single-cheap-test trick (`single_cheap`, opt-in)**: Runs ONLY when a commit selects exactly 1 non-fixture test with `dur_sec <= 0.15 s` outside heavy-dependency files (`tests/test_optimizer.py`, `tests/test_executor.py`, avoiding ~1 s `duckdb`/`pandas` import cost). Payoff is ~10:1 (`~0.20 s` CPU to eliminate a `2.00 s` worker startup cost); net gain is strictly positive on sample (**`+1.607 s`** with profiles, **`+1.584 s`** without profiles).
 
 ### (2) Top 20 Most Expensive Tests (Recorded Runtime vs Sample Selection & Failure Rates)
 Measured against the static + dict-values baseline (`profiles=OFF, verifier=off`) across the 30 sample commits:
