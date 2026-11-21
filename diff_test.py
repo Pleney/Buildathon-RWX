@@ -708,6 +708,79 @@ def generate_synthetic_edits(sqlglot_root: Path, map_data: dict[str, Any]) -> li
         '"%x": "%Y",',
     )
 
+    # --- Phase 3 Quick-Set Stress Cases (commit-level equivalence & traps) ---
+    # 16a. Safe local variable rename inside Node.walk (sqlglot/lineage.py) -> drop to []
+    add(
+        "p3_safe_local_rename",
+        "p3_equiv",
+        "sqlglot/lineage.py",
+        "        visited: set[int] = set()\n        queue = [self]\n        while queue:\n            node = queue.pop()\n            node_id = id(node)\n            if node_id in visited:\n                continue\n            visited.add(node_id)\n            yield node\n            queue.extend(reversed(node.downstream))",
+        "        seen_ids: set[int] = set()\n        worklist = [self]\n        while worklist:\n            cur_node = worklist.pop()\n            cur_id = id(cur_node)\n            if cur_id in seen_ids:\n                continue\n            seen_ids.add(cur_id)\n            yield cur_node\n            worklist.extend(reversed(cur_node.downstream))",
+    )
+
+    # 16b. Parameter rename trap (csv sep -> separator) -> MUST KEEP callers!
+    add(
+        "p3_param_rename_trap",
+        "p3_equiv",
+        "sqlglot/helper.py",
+        'def csv(*args: str, sep: str = ", ") -> str:\n    """\n    Formats any number of string arguments as CSV.\n\n    Args:\n        args: The string arguments to format.\n        sep: The argument separator.\n\n    Returns:\n        The arguments formatted as a CSV string.\n    """\n    return sep.join(arg for arg in args if arg)',
+        'def csv(*args: str, separator: str = ", ") -> str:\n    """\n    Formats any number of string arguments as CSV.\n\n    Args:\n        args: The string arguments to format.\n        sep: The argument separator.\n\n    Returns:\n        The arguments formatted as a CSV string.\n    """\n    return separator.join(arg for arg in args if arg)',
+    )
+
+    # 16c. sqlglot/typing/ local var rename trap (test_typing.py checks co_varnames -> MUST KEEP!)
+    add(
+        "p3_typing_local_rename_trap",
+        "p3_equiv",
+        "sqlglot/typing/snowflake.py",
+        "    last_type = None\n    for ret_type in return_types:\n        last_type = self._maybe_coerce(last_type or ret_type, ret_type)\n\n    self._set_type(expression, last_type)",
+        "    final_type = None\n    for ret_type in return_types:\n        final_type = self._maybe_coerce(final_type or ret_type, ret_type)\n\n    self._set_type(expression, final_type)",
+    )
+
+    # 16d. Class docstring-only edit on GraphHTML (sqlglot/lineage.py) -> narrow cleanly
+    add(
+        "p3_docstring_edit_class",
+        "p3_equiv",
+        "sqlglot/lineage.py",
+        '    """Node to HTML generator using vis.js.',
+        '    """Lineage graph to HTML renderer using vis.js.',
+    )
+
+    # 16e. Function docstring-only edit on anonymize (sqlglot/anonymize.py) -> narrow cleanly
+    add(
+        "p3_docstring_edit_func",
+        "p3_equiv",
+        "sqlglot/anonymize.py",
+        "    Args:\n        sql_or_tokens: The SQL string to anonymize, or its token list.",
+        "    Args:\n        sql_or_tokens: Input SQL string or pre-tokenized token list.",
+    )
+
+    # 16f. Adding an unreferenced, undecorated, import-time-pure public helper function -> narrow!
+    add(
+        "p3_add_unreferenced_public_func",
+        "p3_equiv",
+        "sqlglot/anonymize.py",
+        "REWRITTEN_TYPES = {TokenType.HINT, TokenType.UNKNOWN}",
+        "REWRITTEN_TYPES = {TokenType.HINT, TokenType.UNKNOWN}\n\n\ndef zzz_unused_public_helper_xyz(x: int = 1) -> int:\n    return x + 1",
+    )
+
+    # 16g. Adding a decorated public function with broken decorator -> MUST KEEP importers!
+    add(
+        "p3_add_decorated_public_func_trap",
+        "p3_equiv",
+        "sqlglot/helper.py",
+        'def camel_to_snake_case(name: str) -> str:\n    """Converts `name` from camelCase to snake_case and returns the result."""\n    return CAMEL_CASE_PATTERN.sub("_", name).upper()',
+        'def camel_to_snake_case(name: str) -> str:\n    """Converts `name` from camelCase to snake_case and returns the result."""\n    return CAMEL_CASE_PATTERN.sub("_", name).upper()\n\n\n@nonexistent_decorator_xyz\ndef zzz_broken_dec_func_xyz() -> int:\n    return 1',
+    )
+
+    # 16h. Removing an existing public function -> MUST KEEP importers!
+    add(
+        "p3_remove_public_func_trap",
+        "p3_equiv",
+        "sqlglot/helper.py",
+        'def camel_to_snake_case(name: str) -> str:\n    """Converts `name` from camelCase to snake_case and returns the result."""\n    return CAMEL_CASE_PATTERN.sub("_", name).upper()',
+        'def _camel_to_snake_case_renamed(name: str) -> str:\n    """Converts `name` from camelCase to snake_case and returns the result."""\n    return CAMEL_CASE_PATTERN.sub("_", name).upper()',
+    )
+
     return edits
 
 

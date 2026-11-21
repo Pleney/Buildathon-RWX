@@ -104,16 +104,32 @@ class TestRobustness(unittest.TestCase):
         flat_cons = self._validate_line("pure_comment_cons", res_cons)
         self.assertGreater(len(flat_cons), 0)
 
-    def test_comment_inside_docstring_is_not_ignored(self) -> None:
+    def test_comment_inside_string_and_docstring_safety(self) -> None:
         rel = "sqlglot/serde.py"
         old = self._base_text(rel)
+        # 1. Comment-like text inside an assigned string literal is NEVER ignored
+        new_str = old.replace('CLASS = "c"', 'CLASS = "# not a comment"', 1)
+        patch_str = _make_unified_diff(rel, old, new_str)
+        res_str = self.selector.select_and_pack("string_comment_trap", patch_str)
+        flat_str = self._validate_line("string_comment_trap", res_str)
+        self.assertGreater(len(flat_str), 0)
+
+        # 2. Docstring edits are NOT ast_identical and ALWAYS keep tests/test_docs.py when present
         idx = old.find('"""')
         self.assertNotEqual(idx, -1)
-        new = old[: idx + 3] + "\n# changed docstring text\n" + old[idx + 3 :]
-        patch = _make_unified_diff(rel, old, new)
-        res = self.selector.select_and_pack("docstring_edit", patch)
-        flat = self._validate_line("docstring_edit", res)
-        self.assertGreater(len(flat), 0)
+        new_doc = old[: idx + 3] + "\n# changed docstring text\n" + old[idx + 3 :]
+        ana = pp.analyze_python_change(old.encode("utf-8"), new_doc.encode("utf-8"))
+        self.assertFalse(ana.ast_identical)
+        self.assertTrue(pp.is_docstring_only_change(ana.old_tree, ana.new_tree))
+        docs_num = len(self.tests_list)
+        tests_with_docs = [
+            *self.tests_list,
+            {"number": docs_num, "id": "tests/test_docs.py::test_doctests", "file": "tests/test_docs.py", "seconds": 0.5},
+        ]
+        sel_docs = sel.BlastRadiusSelector(self.map_data, tests_with_docs)
+        patch_doc = _make_unified_diff(rel, old, new_doc)
+        nums_doc = sel_docs.select_test_numbers(patch_doc)
+        self.assertIn(docs_num, nums_doc)
 
     def test_coding_cookie_comment_triggers_broad(self) -> None:
         rel = "sqlglot/dialects/dialect.py"
@@ -314,6 +330,88 @@ class TestRobustness(unittest.TestCase):
         self.assertTrue(all(len(w) > 0 for w in ws))
         flat = [n for w in ws for n in w]
         self.assertEqual(sorted(flat), list(range(25)))
+
+    # --- 10. Phase 3 commit-level equivalence unit & trap tests ---
+    def test_phase3_local_rename_and_traps(self) -> None:
+        import ast
+
+        # Safe local rename
+        self.assertTrue(
+            pp.is_safe_local_rename(
+                ast.parse("def f(a):\n    x = a + 1\n    return x * 2\n"),
+                ast.parse("def f(a):\n    y = a + 1\n    return y * 2\n"),
+            )
+        )
+        # Parameter rename trap -> MUST reject
+        self.assertFalse(
+            pp.is_safe_local_rename(
+                ast.parse("def f(a):\n    return a + 1\n"),
+                ast.parse("def f(b):\n    return b + 1\n"),
+            )
+        )
+        # f-string debug trap `f"{x=}"` -> MUST reject
+        self.assertFalse(
+            pp.is_safe_local_rename(
+                ast.parse('def f(a):\n    x = a\n    return f"{x=}"\n'),
+                ast.parse('def f(a):\n    y = a\n    return f"{y=}"\n'),
+            )
+        )
+        # locals() trap -> MUST reject
+        self.assertFalse(
+            pp.is_safe_local_rename(
+                ast.parse("def f(a):\n    x = a\n    return locals()\n"),
+                ast.parse("def f(a):\n    y = a\n    return locals()\n"),
+            )
+        )
+        # Shadowing a free/builtin name trap -> MUST reject
+        self.assertFalse(
+            pp.is_safe_local_rename(
+                ast.parse("def f(a):\n    x = len(a)\n    return x\n"),
+                ast.parse("def f(a):\n    len = len(a)\n    return len\n"),
+            )
+        )
+        # Non-bijection collision trap -> MUST reject
+        self.assertFalse(
+            pp.is_safe_local_rename(
+                ast.parse("def f(a):\n    x = a\n    y = x + 1\n    return x + y\n"),
+                ast.parse("def f(a):\n    y = a\n    y = y + 1\n    return y + y\n"),
+            )
+        )
+        # End-to-end: sqlglot/typing/ local rename MUST NOT drop test_typing.py
+        rel = "sqlglot/typing/snowflake.py"
+        old = self._base_text(rel)
+        new = old.replace("last_type = None", "final_type = None", 1).replace("last_type", "final_type")
+        res = self.selector.select_and_pack("typing_rename", _make_unified_diff(rel, old, new))
+        flat = self._validate_line("typing_rename", res)
+        self.assertGreater(len(flat), 0)
+
+    def test_phase3_added_public_func_narrowing_and_traps(self) -> None:
+        rel = "sqlglot/helper.py"
+        old = self._base_text(rel)
+        # Unreferenced pure added public func -> narrowed to meta tests only (<= 15 tests)
+        new_safe = old + "\ndef zzz_brand_new_unreferenced_func(x: int = 1) -> int:\n    return x + 1\n"
+        flat_safe = self._validate_line(
+            "add_safe_func",
+            self.selector.select_and_pack("add_safe_func", _make_unified_diff(rel, old, new_safe)),
+        )
+        self.assertGreater(len(flat_safe), 0)
+        self.assertLessEqual(len(flat_safe), 15)
+
+        # Decorated added public func -> broad importers (> 500 tests)
+        new_dec = old + "\n@some_decorator\ndef zzz_decorated_func():\n    return 1\n"
+        flat_dec = self._validate_line(
+            "add_dec_func",
+            self.selector.select_and_pack("add_dec_func", _make_unified_diff(rel, old, new_dec)),
+        )
+        self.assertGreater(len(flat_dec), 500)
+
+        # Added public class -> broad importers (subclasses() / inspect.getmembers safety!)
+        new_cls = old + "\nclass ZzzNewPublicClass:\n    pass\n"
+        flat_cls = self._validate_line(
+            "add_pub_cls",
+            self.selector.select_and_pack("add_pub_cls", _make_unified_diff(rel, old, new_cls)),
+        )
+        self.assertGreater(len(flat_cls), 500)
 
 
 if __name__ == "__main__":

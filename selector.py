@@ -237,6 +237,7 @@ class BlastRadiusSelector:
         # any function in sqlglot/ that references that name
         self._name_ref_tests_cache: dict[str, int] = {}
         self._name_to_locations: dict[str, list[tuple[str, str]]] = {}
+        self._all_referenced_names: set[str] | None = None
         for rel, info in self.ast_index.items():
             if not rel.startswith("sqlglot/"):
                 continue
@@ -244,6 +245,13 @@ class BlastRadiusSelector:
                 lst = self._name_to_locations.setdefault(name, [])
                 for qn in qnames:
                     lst.append((rel, qn))
+
+        # Precompute docs test bits / runtime numbers (for docstring & added-public-func safety)
+        self._docs_test_bits: int = self.test_file_to_tests.get("tests/test_docs.py", 0)
+        self._docs_runtime_nums: list[int] = sorted(
+            t["number"] for t in tests_list if t["id"].startswith("tests/test_docs.py")
+        )
+        self._last_commit_extra_nums: set[int] = set()
 
         # Precompute bitset of tests that load fixtures from each fixture subdir
         self._fixture_dir_tests: dict[str, int] = {}
@@ -645,6 +653,35 @@ class BlastRadiusSelector:
                 self._add_prob(probs, bits if bits else self.all_map_bits, p_ident)
             return
 
+        # 2b. Phase 3: Commit-level equivalence (outside sqlglot/typing/ which inspects
+        #     co_varnames and co_consts in test_typing.py)
+        if (
+            self.enable_p3_equiv
+            and ana.old_tree is not None
+            and ana.new_tree is not None
+            and not rel.startswith("sqlglot/typing/")
+            and not ana.changed_imports
+            and not ana.changed_all
+            and not ana.added_or_removed_public_names
+            and not ana.changed_class_attrs
+            and not ana.changed_module_vars
+        ):
+            if pp.is_docstring_only_change(ana.old_tree, ana.new_tree, ana=ana):
+                self._last_commit_ast_identical.add(rel)
+                if self._docs_test_bits:
+                    self._add_prob(probs, self._docs_test_bits, cfg["p_direct"])
+                if self._docs_runtime_nums:
+                    self._last_commit_extra_nums.update(self._docs_runtime_nums)
+                return
+            if (
+                ana.changed_funcs
+                and not ana.changed_class_headers
+                and not ana.changed_other_module_code
+                and pp.is_safe_local_rename(ana.old_tree, ana.new_tree, ana=ana)
+            ):
+                self._last_commit_ast_identical.add(rel)
+                return
+
         # 3. Root __init__.py: use function-body scoping ONLY when exclusively existing
         #    non-import-time function bodies changed (e.g. transpile, tokenize); if any
         #    changed function runs during module import (e.g. parse_one) or import_time_funcs
@@ -668,12 +705,46 @@ class BlastRadiusSelector:
                 self._add_prob(probs, self.all_map_bits, cfg["p_direct"])
                 return
 
+        # Phase 3: Narrow added_or_removed_public_names when ONLY unreferenced,
+        # undecorated, import-time-pure top-level public functions are added.
+        safe_added_public_funcs: set[str] = set()
+        if (
+            self.enable_p3_equiv
+            and ana.added_or_removed_public_names
+            and cat == "source"
+            and not rel.startswith(("sqlglot/expressions/", "sqlglot/dialects/", "sqlglot/typing/"))
+            and ana.old_tree is not None
+            and ana.new_tree is not None
+            and not ana.changed_all
+            and not ana.changed_other_module_code
+        ):
+            cand_safe = pp.find_safe_added_public_funcs(
+                ana.old_tree, ana.new_tree, ana.added_or_removed_public_names
+            )
+            if cand_safe:
+                all_refs = self._all_referenced_names
+                if all_refs is None:
+                    all_refs = (
+                        set(__builtins__.keys()) if isinstance(__builtins__, dict) else set(dir(__builtins__))
+                    )
+                    all_refs.update(self.test_file_expr_refs.keys())
+                    for _info in self.ast_index.values():
+                        all_refs.update(_info["names_referenced_by"].keys())
+                    self._all_referenced_names = all_refs
+                if all(nm not in all_refs for nm in cand_safe):
+                    safe_added_public_funcs = cand_safe
+                    enum_bits = self._dialect_meta_bits | self._docs_test_bits
+                    if enum_bits:
+                        self._add_prob(probs, enum_bits, cfg["p_direct"])
+                    if self._docs_runtime_nums:
+                        self._last_commit_extra_nums.update(self._docs_runtime_nums)
+
         # 4. Package __init__.py, changed imports, __all__, added/removed public names,
         #    or arbitrary top-level executable statements -> all importers
         if (
             cat == "pkg_init"
             or ana.changed_all
-            or ana.added_or_removed_public_names
+            or (ana.added_or_removed_public_names and not safe_added_public_funcs)
             or ana.changed_other_module_code
         ):
             bits = self._importer_tests(rel)
@@ -707,6 +778,8 @@ class BlastRadiusSelector:
 
         any_scope_changed = False
         for fq in ana.changed_funcs:
+            if fq in safe_added_public_funcs:
+                continue
             ftests = file_fmap.get(fq, 0)
             span = func_spans.get(fq)
             scope_changed = self._func_scope_changed(rel, fq, new_tree)
@@ -1163,6 +1236,7 @@ class BlastRadiusSelector:
         self._last_commit_py_overlay.clear()
         self._last_commit_ast_identical.clear()
         self._last_commit_source_trees.clear()
+        self._last_commit_extra_nums.clear()
 
         per_file_probs: list[tuple[str, str, dict[int, float]]] = []
 
@@ -1238,12 +1312,12 @@ class BlastRadiusSelector:
                 if p > probs.get(idx, 0.0):
                     probs[idx] = p
 
-        if not probs:
+        if not probs and not self._last_commit_extra_nums:
             return []
 
         # FR4: Cost-aware inclusion: include test t when P(fail) * 300 > runtime / k_div
         k_div = max(1.0, self.cfg["fr4_k_divisor"])
-        selected: set[int] = set()
+        selected: set[int] = set(self._last_commit_extra_nums)
         for idx, p in probs.items():
             tnum = self.idx_to_num[idx]
             if tnum is None:
