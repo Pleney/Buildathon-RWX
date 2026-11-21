@@ -45,3 +45,27 @@
 | Container CPU time (`user + sys`) | **0.096 s** (`0.084s user + 0.012s sys`) |
 | Oracle lower bound (30 samples) | **94.351 s** |
 | Practice target | **< 142.9 s** (~107 s equivalent on 30-commit scale) |
+
+---
+
+## Phase 2: Map Build & Verification (`build_map.py` -> `map.pkl.gz`)
+
+### Design Decisions
+- Built purely from the pinned sqlglot commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa` inside a container based on the exact pinned `python:3.13-slim@sha256:e48f59...` image with `requirements.lock` and `SKIP_INTEGRATION=0`.
+- Does **not** embed `tests.json` numbers: indexes tests by sorted pytest node ID (`test_ids`), mapped dynamically to `/data/tests.json` numbers at runtime.
+- Uses Python 3.13 `sys.monitoring` (`LINE` + `PY_START` with per-event `DISABLE` + `restart_events()` per test) across 4 balanced parallel workers.
+- Key engineering fixes discovered during verification:
+  1. **Synchronous `ProcessPoolExecutor`**: Both `tests/test_optimizer.py` and `tests/test_executor.py` run core work in spawned child processes; replacing `ProcessPoolExecutor` with an in-process `_SyncExecutor` during tracing captures full optimizer & executor coverage.
+  2. **`Expr.__init__` (not `Expression.__init__`)**: Hooking `Expr.__init__` avoids shadowing `TimeUnit.__init__` in `_TimeUnit`'s MRO; all 1,620 tests + 25,440 subtests pass with 0 failures during tracing.
+  3. **`setUpClass` hookwrapper**: Intercepting pytest's `_unittest_setUpClass_fixture_*` attributes class-level fixture opens (e.g., TPC-H / TPC-DS CSVs in `TestExecutor.setUpClass`) and setup lines to all tests in that class, not just the first test.
+  4. **Dynamic `compile()` filter**: Ignoring non-file `co_filename` strings from `sqlglot/executor/python.py` keeps `line_to_tests` clean (237 real `.py` files).
+- Stored in version-independent `pickle` protocol 4 + `zlib` level 9 (`map.pkl.gz`).
+
+### Verification Results
+- **Build time**: 53.8 s (4 parallel workers inside Docker)
+- **Active tests indexed**: 1,620 (1 skipped) — exact 1-to-1 match with `tests.json` (`missing=0, extra=0`)
+- **Test pass rate during tracing**: 1,620 passed, 0 failed, 25,440 subtests passed
+- **Coverage stats**: 237 files (85,152 covered lines), 195 files (5,064 covered functions), 76 mapped fixtures, 122 dialect/parser/generator/typing files, 1,053 `Expr` classes
+- **Map file size**: **2.24 MB** compressed (14.54 MB raw pickle4)
+- **Map load time**: **48.6 ms** (18.6 ms decompress + 30.0 ms unpickle)
+
