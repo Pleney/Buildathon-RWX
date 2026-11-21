@@ -220,47 +220,50 @@ class BlastRadiusSelector:
         self._src_cache[rel] = raw
         return raw
 
-    def _ensure_ast_caches(self, rel: str) -> None:
+    def _ensure_ast_caches(self, rel: str, pre_parsed: ast.AST | None = None) -> None:
         if rel in self._stmt_spans_cache:
             return
-        raw = self._get_base_source(rel)
         spans: list[tuple[int, int]] = []
         lambdas: list[tuple[int, int]] = []
         fnodes: dict[str, ast.AST] = {}
-        if raw is not None:
-            try:
-                tree = ast.parse(raw)
-                scope: list[str] = []
+        tree = pre_parsed
+        if tree is None:
+            raw = self._get_base_source(rel)
+            if raw is not None:
+                try:
+                    tree = ast.parse(raw)
+                except Exception:
+                    tree = None
+        if tree is not None:
+            scope: list[str] = []
 
-                def walk_defs(body: list[ast.stmt]) -> None:
-                    for st in body:
-                        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                            qn = ".".join((*scope, st.name))
-                            fnodes[qn] = st
-                            scope.append(st.name)
-                            walk_defs(st.body)
-                            scope.pop()
-                        elif isinstance(st, ast.ClassDef):
-                            scope.append(st.name)
-                            walk_defs(st.body)
-                            scope.pop()
+            def walk_defs(body: list[ast.stmt]) -> None:
+                for st in body:
+                    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        qn = ".".join((*scope, st.name))
+                        fnodes[qn] = st
+                        scope.append(st.name)
+                        walk_defs(st.body)
+                        scope.pop()
+                    elif isinstance(st, ast.ClassDef):
+                        scope.append(st.name)
+                        walk_defs(st.body)
+                        scope.pop()
 
-                walk_defs(tree.body)
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.stmt) and not isinstance(
-                        node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-                    ):
-                        s = getattr(node, "lineno", None)
-                        e = getattr(node, "end_lineno", None)
-                        if s is not None and e is not None:
-                            spans.append((s, e))
-                    elif isinstance(node, ast.Lambda):
-                        s = getattr(node, "lineno", None)
-                        e = getattr(node, "end_lineno", None)
-                        if s is not None and e is not None:
-                            lambdas.append((s, e))
-            except Exception:
-                pass
+            walk_defs(tree.body)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.stmt) and not isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    s = getattr(node, "lineno", None)
+                    e = getattr(node, "end_lineno", None)
+                    if s is not None and e is not None:
+                        spans.append((s, e))
+                elif isinstance(node, ast.Lambda):
+                    s = getattr(node, "lineno", None)
+                    e = getattr(node, "end_lineno", None)
+                    if s is not None and e is not None:
+                        lambdas.append((s, e))
         self._stmt_spans_cache[rel] = spans
         self._lambda_spans_cache[rel] = lambdas
         self._func_node_cache[rel] = fnodes
@@ -280,12 +283,13 @@ class BlastRadiusSelector:
         return any(s <= lineno <= e for s, e in self._lambda_spans_cache[rel])
 
     @staticmethod
-    def _func_scope_signature(node: ast.AST) -> tuple[str, str, frozenset[str], bool]:
+    def _func_scope_signature(node: ast.AST) -> tuple[str, str, str | None, frozenset[str], bool]:
         """Extract compile-time properties of a function that affect the whole body:
-        arguments/defaults, decorators, locally bound names, and generator/yield flag."""
+        arguments/defaults, decorators, docstring, locally bound names, and yield flag."""
         assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         args_dump = ast.dump(node.args, include_attributes=False)
         decs_dump = "|".join(ast.dump(d, include_attributes=False) for d in node.decorator_list)
+        doc = ast.get_docstring(node, clean=False)
         bound: set[str] = set()
         has_yield = False
         # Walk only this function's own scope (do not descend into nested def/class)
@@ -310,7 +314,7 @@ class BlastRadiusSelector:
                 for a in cur.names:
                     bound.add(a.asname or a.name.split(".")[0])
             stack.extend(ast.iter_child_nodes(cur))
-        return (args_dump, decs_dump, frozenset(bound), has_yield)
+        return (args_dump, decs_dump, doc, frozenset(bound), has_yield)
 
     def _func_scope_changed(self, rel: str, fq: str, new_tree: ast.AST | None) -> bool:
         """Return True if signature, decorators, local bindings, or yield-ness changed."""
@@ -507,12 +511,9 @@ class BlastRadiusSelector:
         file_fmap = self.func_to_tests.get(rel, {})
         ast_funcs = self.ast_index.get(rel, {}).get("funcs", [])
         func_spans = {qn: (s, e) for s, e, qn in ast_funcs}
-        new_tree: ast.AST | None = None
-        if ana.changed_funcs:
-            try:
-                new_tree = ast.parse(new_bytes)
-            except Exception:
-                new_tree = None
+        if ana.old_tree is not None and (ana.changed_funcs or ana.changed_class_attrs):
+            self._ensure_ast_caches(rel, pre_parsed=ana.old_tree)
+        new_tree = ana.new_tree
 
         for fq in ana.changed_funcs:
             ftests = file_fmap.get(fq, 0)

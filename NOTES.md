@@ -147,6 +147,17 @@
 - Even a theoretically perfect pure-static line-coverage selector (without running tests at decision time) has a hard floor of **~160 s** on 30 samples (**~213 s** scaled to 40 practice commits), whereas the #1 practice score is **142.9 s** (~107 s on 30-commit scale).
 - Because PRD FR7 specifies stdlib-only / no sqlglot import / no pytest at decision time, this implementation strictly obeys FR7. Reaching `< 142.9 s` on practice requires relaxing FR7 to selectively run fast candidate tests in-container (explicitly permitted by `README.md`: "Running sqlglot's tests while you decide is allowed, and you pay for the time") so passing zero-fail commits emit `"workers": []` and passing fast canaries down-weight 21.5 s `test_execute_tpcds`.
 
+---
+
+## Phase 7: Robustness Suite (`tests/test_robustness.py`) & CPU Profiling
+
+- Added 18 synthetic robustness tests in `tests/test_robustness.py` (standalone against `map.pkl.gz`, zero dependency on `sample/`) covering: docs-only README, pure comment + conservative comment mode, comment inside docstring, PEP 263 coding cookie trap, new/removed public functions, constant edit, decorator change, import added, syntax-breaking edit, new/deleted/renamed files, test-file edit, known & unknown fixtures, `pyproject.toml`, `conftest.py`, Rust/tokenizer (`sqlglotrs`, `tokenizer_core.py`), `sqlglot/__init__.py`, unknown file extensions, binary/empty/malformed patches, and packer invariants.
+- **Bug caught by robustness suite**: editing a function docstring (which does not emit bytecode `LINE` events) was initially filtered by the unreachable-statement check; fixed by including `ast.get_docstring(node, clean=False)` in `_func_scope_signature`.
+- **CPU optimization**: reused `old_tree`/`new_tree` parsed in `analyze_python_change` instead of re-parsing files in `selector.py`.
+- All 18 tests pass under `python -S -E -m unittest` in **0.420 s**.
+- Local CPU time for map load + 30 commits: **0.516 s** (~0.75 s projected for 45 commits).
+
+
 
 
 

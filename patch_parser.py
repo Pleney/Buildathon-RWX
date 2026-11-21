@@ -453,6 +453,8 @@ class PythonChangeAnalysis:
     changed_imports: bool = False
     changed_all: bool = False
     changed_other_module_code: bool = False
+    old_tree: ast.AST | None = None
+    new_tree: ast.AST | None = None
 
 
 def _dump_node(node: ast.AST) -> str:
@@ -630,6 +632,8 @@ def analyze_python_change(old_bytes: bytes, new_bytes: bytes) -> PythonChangeAna
     except Exception:
         res.syntax_error = True
         return res
+    res.old_tree = old_tree
+    res.new_tree = new_tree
 
     # 3. Exact AST equivalence check (ignores pure comments & harmless whitespace,
     #    but catches string literals, docstrings, indentation changes, syntax errors)
