@@ -69,3 +69,19 @@
 - **Map file size**: **2.24 MB** compressed (14.54 MB raw pickle4)
 - **Map load time**: **48.6 ms** (18.6 ms decompress + 30.0 ms unpickle)
 
+---
+
+## Phase 3: Patch Parser, In-Memory Applier & File Classifier (`patch_parser.py`)
+
+### Capabilities Implemented
+- Unified diff parser handling `diff --git` and plain `---`/`+++`, renames, new/deleted files, binary patches, quoted paths, `\ No newline at end of file`, multi-hunk files, empty patches, and malformed diffs (never crashes; flags `parse_error=True`).
+- Exact old-file changed line tracking (separating modified/deleted lines and pure-insertion anchors from unchanged 3-line diff context).
+- In-memory hunk application against compressed `base_sources` with CRLF/LF preservation.
+- Principled file classifier: `fixture`, `config`, `rust_or_c`, `test`, `test_helper`, `root_init`, `pkg_init`, `source`, `docs`, `other`.
+- Python AST semantic diff analyzer:
+  - Verifies PEP 263 encoding (`tokenize.detect_encoding`) and `ast.parse` on patched bytes (flags `syntax_error=True` on any parse/encoding failure).
+  - Detects exact AST equivalence (`ast_identical=True`) — safely distinguishes genuine comments/formatting from comments inside multiline strings, docstring edits, indentation changes, coding cookies, or line-continuation syntax errors.
+  - Extracts changed functions/methods, class headers (bases/decorators), class attributes (with exact changed dict keys when a class dict literal is modified), module-level variables (with dict keys), imports, `__all__`, and added/removed public names.
+- Verified on all 30 sample patches: 30/30 parsed and applied cleanly with zero errors.
+
+
