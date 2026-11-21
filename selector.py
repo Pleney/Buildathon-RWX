@@ -33,9 +33,11 @@ except ImportError:
     _packer_mod = None  # type: ignore[assignment]
 
 try:
-    import verifier as _verifier_mod  # noqa: E402
+    import expr_profiler as _expr_profiler_mod  # noqa: E402
 except ImportError:
-    _verifier_mod = None  # type: ignore[assignment]
+    _expr_profiler_mod = None  # type: ignore[assignment]
+
+_verifier_mod: Any = None
 
 DATA_DIR = Path("/data")
 DEFAULT_MAP_PATH = _APP_DIR / "map.pkl.gz"
@@ -131,16 +133,37 @@ class BlastRadiusSelector:
         self.num_to_id: dict[int, str] = {t["number"]: t["id"] for t in tests_list}
         self.all_test_nums: list[int] = sorted(self.valid_test_nums)
 
-        # Optional hybrid in-container verifier (active when /sqlglot is present on Linux)
+        # Build-time per-test expression-site profile pruning (default ON when map includes profiles)
+        self.use_expr_profiles: bool = (
+            _expr_profiler_mod is not None
+            and os.environ.get("BLAST_DISABLE_PROFILES", "0") != "1"
+        )
+
+        # Optional hybrid in-container verifier mode:
+        #   "off"          - no test execution (lowest CPU)
+        #   "single_cheap" - only verify a single cheap candidate (<= 0.15 s) to remove 2.0 s worker cost
+        #   "full"         - full v3 economic-gated verifier
+        # Legacy BLAST_DISABLE_VERIFIER=1 forces "off".
+        if os.environ.get("BLAST_DISABLE_VERIFIER", "0") == "1":
+            self.verifier_mode: str = "off"
+        else:
+            self.verifier_mode = os.environ.get("BLAST_VERIFIER_MODE", "single_cheap").strip().lower()
+        self.single_cheap_max_sec: float = float(os.environ.get("BLAST_SINGLE_CHEAP_MAX_SEC", "0.15"))
+
         self.verifier: Any = None
-        if (
-            _verifier_mod is not None
-            and os.environ.get("BLAST_DISABLE_VERIFIER", "0") != "1"
-            and DEFAULT_SQLGLOT_DIR.is_dir()
-        ):
-            v = _verifier_mod.HybridVerifier(DEFAULT_SQLGLOT_DIR)
-            if v.available:
-                self.verifier = v
+        if self.verifier_mode in ("single_cheap", "full") and DEFAULT_SQLGLOT_DIR.is_dir():
+            global _verifier_mod
+            if _verifier_mod is None:
+                try:
+                    import verifier as _vmod
+
+                    _verifier_mod = _vmod
+                except ImportError:
+                    _verifier_mod = None
+            if _verifier_mod is not None:
+                v = _verifier_mod.HybridVerifier(DEFAULT_SQLGLOT_DIR)
+                if v.available:
+                    self.verifier = v
 
         # Map internal bit indices (0..N-1) to /data/tests.json test numbers
         map_test_ids: list[str] = self.m["test_ids"]
@@ -168,10 +191,12 @@ class BlastRadiusSelector:
         self.expr_class_file: dict[str, str] = self.m["expr_class_file"]
         self.test_file_expr_refs: dict[str, list[str]] = self.m.get("test_file_expr_refs", {})
         self.base_sources: dict[str, bytes] = self.m["base_sources"]
+        self.expr_profiles: dict[str, dict[tuple[int, int], tuple[int, ...]]] = self.m.get("expr_profiles", {})
 
         # Cache per-commit patched bytes & AST analyses to avoid duplicate ast.parse
         self._last_commit_py_overlay: dict[str, tuple[bytes | None, bytes | None]] = {}
         self._last_commit_ast_identical: set[str] = set()
+        self._last_commit_source_trees: list[tuple[str, ast.AST, ast.AST]] = []
         self._src_cache: dict[str, bytes] = {}
         self._stmt_spans_cache: dict[str, list[tuple[int, int]]] = {}
         self._lambda_spans_cache: dict[str, list[tuple[int, int]]] = {}
@@ -557,6 +582,8 @@ class BlastRadiusSelector:
             self._last_commit_ast_identical.add(rel)
         else:
             self._last_commit_py_overlay[rel] = (old_bytes, new_bytes)
+            if not ana.syntax_error and ana.old_tree is not None and ana.new_tree is not None:
+                self._last_commit_source_trees.append((rel, ana.old_tree, ana.new_tree))
 
         # 1. Syntax error or encoding change -> all importers + dialect tests + meta
         if ana.syntax_error:
@@ -1018,6 +1045,7 @@ class BlastRadiusSelector:
         force_all = False
         self._last_commit_py_overlay.clear()
         self._last_commit_ast_identical.clear()
+        self._last_commit_source_trees.clear()
 
         for fp, cat in zip(parsed.files, categories):
             if cat == "docs":
@@ -1049,6 +1077,37 @@ class BlastRadiusSelector:
         if not probs:
             return []
 
+        # Build-time per-test expression-site profile pruning:
+        # Only when the ENTIRE commit modifies a single non-docs, non-AST-identical
+        # Python source file, drop test T ONLY if T's own recorded profile at the
+        # single edited expression site proves the edit cannot change T's trace.
+        if (
+            self.use_expr_profiles
+            and self.expr_profiles
+            and len(self._last_commit_source_trees) == 1
+        ):
+            active_files = sum(
+                1
+                for fp, cat in zip(parsed.files, categories)
+                if cat != "docs" and fp.base_path not in self._last_commit_ast_identical
+            )
+            if active_files == 1:
+                rel_p, old_t, new_t = self._last_commit_source_trees[0]
+                file_profs = self.expr_profiles.get(rel_p)
+                if file_profs:
+                    cand_bits = 0
+                    for idx in probs:
+                        cand_bits |= 1 << idx
+                    proven = _expr_profiler_mod.prove_unchanged_test_bits(
+                        old_t, new_t, file_profs, cand_bits
+                    )
+                    if proven:
+                        for idx in _iter_set_bits(proven):
+                            probs.pop(idx, None)
+
+        if not probs:
+            return []
+
         # FR4: Cost-aware inclusion: include test t when P(fail) * 300 > runtime / k_div
         k_div = max(1.0, self.cfg["fr4_k_divisor"])
         selected: set[int] = set()
@@ -1069,20 +1128,34 @@ class BlastRadiusSelector:
 
         selected_sorted = sorted(selected)
 
-        # Optional Hybrid In-Container Verification (exact run-and-drop + shadow equivalence)
+        # Optional Hybrid In-Container Verification
         if self.verifier is not None and selected_sorted:
-            patched_py, patched_nonpy, is_fixture_only, ok = self._build_overlay_for_verifier(
-                parsed, categories
-            )
-            if ok and (patched_py or patched_nonpy):
-                cands = [
-                    (n, self.num_to_id[n], self.dur_sec[n])
-                    for n in selected_sorted
-                    if n in self.num_to_id
-                ]
-                selected_sorted = self.verifier.verify_candidates(
-                    cands, patched_py, patched_nonpy, is_fixture_only=is_fixture_only
+            should_try = True
+            if self.verifier_mode == "single_cheap":
+                # Only run a single cheap, lightweight test (avoiding duckdb/pandas import cost)
+                # to eliminate a 2.00 s worker startup cost (~10:1 payoff ratio).
+                if len(selected_sorted) == 1:
+                    tnum0 = selected_sorted[0]
+                    nid0 = self.num_to_id.get(tnum0, "")
+                    should_try = (
+                        self.dur_sec[tnum0] <= self.single_cheap_max_sec
+                        and not nid0.startswith(("tests/test_optimizer.py::", "tests/test_executor.py::"))
+                    )
+                else:
+                    should_try = False
+            if should_try:
+                patched_py, patched_nonpy, is_fixture_only, ok = self._build_overlay_for_verifier(
+                    parsed, categories
                 )
+                if ok and (patched_py or patched_nonpy):
+                    cands = [
+                        (n, self.num_to_id[n], self.dur_sec[n])
+                        for n in selected_sorted
+                        if n in self.num_to_id
+                    ]
+                    selected_sorted = self.verifier.verify_candidates(
+                        cands, patched_py, patched_nonpy, is_fixture_only=is_fixture_only
+                    )
 
         return selected_sorted
 

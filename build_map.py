@@ -31,6 +31,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+import expr_profiler as ep  # noqa: E402
+
 PINNED_COMMIT = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 
 
@@ -110,9 +116,12 @@ class _CoverageTracerPlugin:
         self.failed_nodeids: list[str] = []
 
         # Path normalization cache
-        self._path_cache: dict[str, str | None] = {}
+        self._path_cache: dict[tuple[str, bool], str | None] = {}
         self._dialect_files_cache: dict[type, tuple[str, ...]] = {}
         self._wrapped_classes: set[type] = set()
+
+        # Per-test expression-site profiler
+        self.recorder = ep.BuildTimeProfileRecorder()
 
         # Originals for hooks
         self._orig_open = builtins.open
@@ -243,6 +252,11 @@ class _CoverageTracerPlugin:
         io.open = tracked_io_open  # type: ignore[assignment]
         gzip.open = tracked_gzip_open  # type: ignore[assignment]
 
+        # 2b. Install AST expression-site profiler BEFORE importing sqlglot
+        builtins.__blast_bp__ = self.recorder.branch_probe  # type: ignore[attr-defined]
+        builtins.__blast_cp__ = self.recorder.compare_probe  # type: ignore[attr-defined]
+        sys.meta_path.insert(0, ep.ProfilingMetaPathFinder(self.repo_root, self.recorder))
+
         # 3. Hook Dialect & Expression in sqlglot
         import sqlglot.dialects.dialect as dialect_mod
         import sqlglot.expressions.core as expr_core
@@ -282,6 +296,7 @@ class _CoverageTracerPlugin:
 
     def _start_tracing(self, key: Any) -> None:
         self.active_key = key
+        self.recorder.switch_target(key)
         sys.monitoring.restart_events()
         sys.monitoring.set_events(
             self.tool_id,
@@ -290,6 +305,7 @@ class _CoverageTracerPlugin:
         self.enabled = True
 
     def _stop_tracing(self) -> None:
+        self.recorder.stop()
         if self.enabled:
             sys.monitoring.set_events(self.tool_id, sys.monitoring.events.NO_EVENTS)
             self.enabled = False
@@ -389,6 +405,10 @@ def run_worker(sqlglot_dir: Path, shard_files: list[str], shard_out: Path) -> No
             plugin.dialects[nodeid].update(plugin.dialects[ck])
         if ck in plugin.exprs:
             plugin.exprs[nodeid].update(plugin.exprs[ck])
+        if ck in plugin.recorder.records:
+            dst = plugin.recorder.records.setdefault(nodeid, {})
+            for sid, fl in plugin.recorder.records[ck].items():
+                dst[sid] = dst.get(sid, 0) | fl
 
     # Keep only per-test (string) keys
     out = {
@@ -401,6 +421,9 @@ def run_worker(sqlglot_dir: Path, shard_files: list[str], shard_out: Path) -> No
         "fixtures": {k: sorted(v) for k, v in plugin.fixtures.items() if isinstance(k, str)},
         "dialects": {k: sorted(v) for k, v in plugin.dialects.items() if isinstance(k, str)},
         "exprs": {k: sorted(v) for k, v in plugin.exprs.items() if isinstance(k, str)},
+        "prof_sites": plugin.recorder.sites,
+        "prof_records": {k: v for k, v in plugin.recorder.records.items() if isinstance(k, str)},
+        "prof_inactive_sids": sorted(plugin.recorder.inactive_sids),
     }
     shard_out.write_bytes(pickle.dumps(out, protocol=4))
 
@@ -891,6 +914,11 @@ def build_map(
     expr_to_tests: dict[str, int] = defaultdict(int)
     test_file_to_tests: dict[str, int] = defaultdict(int)
 
+    # Build-time per-test expression-site profiles:
+    # site_acc[(rel, lineno, col)] = [is_compare, seen, false, true, eq, is2eq_unsafe, eq2is_unsafe, order_unsafe]
+    prof_acc: dict[tuple[str, int, int], list[Any]] = {}
+    prof_inactive_sites: set[tuple[str, int, int]] = set()
+
     for idx, tfile in enumerate(test_files_list):
         test_file_to_tests[tfile] |= 1 << idx
 
@@ -954,6 +982,40 @@ def build_map(
             for ename in elist:
                 expr_to_tests[ename] |= bit
 
+        # Merge expression-site profiles from this shard
+        prof_sites = sr.get("prof_sites", ())
+        for sid in sr.get("prof_inactive_sids", ()):
+            if 0 <= sid < len(prof_sites):
+                rel, ln, col, _is_cmp = prof_sites[sid]
+                prof_inactive_sites.add((rel, ln, col))
+        for nodeid, sid_flags in sr.get("prof_records", {}).items():
+            idx = id_to_idx.get(nodeid)
+            if idx is None:
+                continue
+            bit = 1 << idx
+            for sid, fl in sid_flags.items():
+                rel, ln, col, is_cmp = prof_sites[sid]
+                key = (rel, ln, col)
+                acc = prof_acc.get(key)
+                if acc is None:
+                    acc = [is_cmp, 0, 0, 0, 0, 0, 0, 0]
+                    prof_acc[key] = acc
+                elif is_cmp:
+                    acc[0] = True
+                acc[1] |= bit
+                if fl & ep.BIT_FALSE:
+                    acc[2] |= bit
+                if fl & ep.BIT_TRUE:
+                    acc[3] |= bit
+                if fl & ep.BIT_EQ:
+                    acc[4] |= bit
+                if fl & ep.BIT_IS_TO_EQ_UNSAFE:
+                    acc[5] |= bit
+                if fl & ep.BIT_EQ_TO_IS_UNSAFE:
+                    acc[6] |= bit
+                if fl & ep.BIT_ORDER_UNSAFE:
+                    acc[7] |= bit
+
     # Also roll line_to_tests into func_to_tests and class_to_tests so every
     # function/class covers all tests that hit any line inside its span
     for rel, lmap in line_to_tests.items():
@@ -999,9 +1061,24 @@ def build_map(
             "exports": info["exports"],
         }
 
+    # Pack expression-site profiles (excluding any site hit during import/collection time)
+    expr_profiles: dict[str, dict[tuple[int, int], tuple[int, ...]]] = defaultdict(dict)
+    skipped_inactive = 0
+    for key, acc in prof_acc.items():
+        if key in prof_inactive_sites:
+            skipped_inactive += 1
+            continue
+        rel, ln, col = key
+        if acc[0]:
+            expr_profiles[rel][(ln, col)] = (
+                acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7]
+            )
+        else:
+            expr_profiles[rel][(ln, col)] = (acc[1], acc[2], acc[3])
+
     # Build final compact map dict
     final_map = {
-        "version": 1,
+        "version": 2,
         "commit": PINNED_COMMIT,
         "test_ids": test_ids,
         "test_files": test_files_list,
@@ -1023,6 +1100,7 @@ def build_map(
         "expr_class_file": static["expr_class_file"],
         "test_file_expr_refs": static["test_file_expr_refs"],
         "base_sources": static["base_sources"],
+        "expr_profiles": {k: dict(v) for k, v in expr_profiles.items()},
     }
 
     raw_pkl = pickle.dumps(final_map, protocol=4)
@@ -1033,6 +1111,7 @@ def build_map(
     total_time = time.perf_counter() - t0
     covered_lines = sum(len(v) for v in line_to_tests.values())
     covered_funcs = sum(len(v) for v in func_to_tests.values())
+    profiled_sites = sum(len(v) for v in expr_profiles.values())
     print(f"[build_map] Done in {total_time:.1f}s!", file=sys.stderr)
     print(f"  Tests indexed:      {len(test_ids)}", file=sys.stderr)
     print(f"  Files with lines:   {len(line_to_tests)} ({covered_lines} covered lines)", file=sys.stderr)
@@ -1040,6 +1119,11 @@ def build_map(
     print(f"  Fixtures mapped:    {len(fixture_to_tests)}", file=sys.stderr)
     print(f"  Dialects mapped:    {len(dialect_to_tests)}", file=sys.stderr)
     print(f"  Exprs mapped:       {len(expr_to_tests)}", file=sys.stderr)
+    print(
+        f"  Expr profile sites: {profiled_sites} across {len(expr_profiles)} files "
+        f"(excluded {skipped_inactive} import-time sites)",
+        file=sys.stderr,
+    )
     print(
         f"  Map size:           {len(comp)/1e6:.2f} MB compressed "
         f"({len(raw_pkl)/1e6:.2f} MB raw pickle4)",

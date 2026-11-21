@@ -230,6 +230,82 @@ Measured inside the exact scorer container (`--cpus 2 --read-only --user 65534:6
 | Step 3 (`e490f4d`) | + 60% wall-time deadline guard (shadow ON) | 94.581 s | 10.211 s | 104.792 s | 0 | 2 (shadow) |
 | **Step 4–5 (HEAD)** | **Shadow & Laplace unrun-pruning DISABLED** | **144.822 s** | **9.402 s** | **154.224 s** | **0** | **0 / 19** |
 
+---
+
+## Branch `profiles-v4`: Ablation, Top-20 Expensive Tests & Build-Time Test-Specific Profiles
+
+### Practice Board Feedback (Safe v3 `07f2971`)
+- Safe v3 (`07f2971`, execution-based verifier ON, shadow pruning OFF) scored **207.4 s** on the 40-commit hidden practice set (`198.1 s` simulated + `9.3 s` CPU), slightly worse than Pure-Static v1 (`90f2d8f`) at **206.7 s** (`205.456 s` simulated + `1.19 s` CPU, 0 misses). Execution-based verification is roughly break-even when heavy tests remain unrunnable.
+
+### (1) Local Ablation (30 Sample Commits, Exact Scorer Docker Limits, 3-Run Median CPU)
+Added explicit verifier mode control (`BLAST_VERIFIER_MODE=off|single_cheap|full`, with `BLAST_DISABLE_VERIFIER=1` aliasing `off` and `BLAST_DISABLE_PROFILES=1` toggling build-time profiles). When `BLAST_VERIFIER_MODE=off`, `verifier.py` is never imported.
+
+| Configuration | Simulated | Median CPU (3 runs) | Total (`sim + CPU`) | Misses | Delta vs v1 Static |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| (a) Pure-Static v1 (`90f2d8f`) | 165.365 s | 0.737 s | **166.102 s** | 0 | baseline |
+| (b) Static + dict-values filter (`profiles=OFF, verifier=off`) | 162.412 s | 1.091 s | **163.503 s** | 0 | -2.599 s |
+| (b+) Static + dict-values + `single_cheap` (`profiles=OFF`) | 160.408 s | 1.511 s | **161.919 s** | 0 | -4.183 s (+1.584 s over `off`) |
+| (c) Full v3 (`07f2971`, `profiles=OFF, verifier=full, shadow=OFF`) | 144.822 s | 9.452 s | **154.274 s** | 0 | -11.828 s (207.4 s on practice) |
+| (d) Static + dict-values + **test-specific profiles** (`verifier=off`) | **109.635 s** | **1.214 s** | **110.849 s** | 0 | **-55.253 s** (-52.654 s vs (b)) |
+| (e) Static + dict-values + **test-specific profiles** + **`single_cheap`** (default) | **107.631 s** | **1.611 s** | **109.242 s** | 0 | **-56.860 s** (+1.607 s over (d)) |
+
+- **Single-cheap-test trick (`single_cheap`)**: Runs ONLY when a commit selects exactly 1 non-fixture test with `dur_sec <= 0.15 s` outside heavy-dependency files (`tests/test_optimizer.py`, `tests/test_executor.py`, avoiding ~1 s `duckdb`/`pandas` import cost). Payoff is ~10:1 (`~0.20 s` CPU to eliminate a `2.00 s` worker startup cost); net gain is strictly positive (**`+1.607 s`** with profiles, **`+1.584 s`** without profiles), so `single_cheap` is kept as default with `BLAST_VERIFIER_MODE=off` / `BLAST_DISABLE_VERIFIER=1` available to disable it completely.
+
+### (2) Top 20 Most Expensive Tests (Recorded Runtime vs Sample Selection & Failure Rates)
+Measured against the static + dict-values baseline (`profiles=OFF, verifier=off`) across the 30 sample commits:
+
+| Rank | Test # | Test ID | Runtime (s) | Selected (of 30) | Actually Fails | Fail Rate (when selected) |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | 1490 | `tests/test_parser.py::TestParser::test_max_nodes` | 28.817 | 0 | 0 | — |
+| 2 | 1106 | `tests/test_executor.py::TestExecutor::test_execute_tpcds` | 21.454 | 4 | 2 | 50.0% |
+| 3 | 1224 | `tests/test_generator.py::TestGenerator::test_generator_memory` | 6.686 | 0 | 0 | — |
+| 4 | 1107 | `tests/test_executor.py::TestExecutor::test_execute_tpch` | 3.863 | 1 | 1 | 100.0% |
+| 5 | 1123 | `tests/test_lineage.py::TestLineage::test_optimized_tpch` | 3.537 | 0 | 0 | — |
+| 6 | 1428 | `tests/test_optimizer.py::TestOptimizer::test_scope` | 2.533 | 1 | 0 | 0.0% |
+| 7 | 1440 | `tests/test_optimizer.py::TestOptimizer::test_tpcds` | 2.232 | 3 | 2 | 66.7% |
+| 8 | 1295 | `tests/test_optimizer.py::TestOptimizer::test_annotate_funcs` | 1.963 | 3 | 2 | 66.7% |
+| 9 | 1382 | `tests/test_optimizer.py::TestOptimizer::test_qualify_columns` | 1.406 | 4 | 3 | 75.0% |
+| 10 | 1082 | `tests/test_executor.py::TestExecutor::test_agg_order` | 1.364 | 0 | 0 | — |
+| 11 | 1361 | `tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls` | 1.331 | 1 | 0 | 0.0% |
+| 12 | 1541 | `tests/test_transpile.py::TestTranspile::test_cache_does_not_retain_queries` | 1.298 | 0 | 0 | — |
+| 13 | 1343 | `tests/test_optimizer.py::TestOptimizer::test_merge_subqueries` | 1.016 | 3 | 2 | 66.7% |
+| 14 | 1313 | `tests/test_optimizer.py::TestOptimizer::test_canonicalize` | 1.006 | 1 | 1 | 100.0% |
+| 15 | 1415 | `tests/test_optimizer.py::TestOptimizer::test_qualify_struct_star_long_cte_chain` | 0.905 | 0 | 0 | — |
+| 16 | 1560 | `tests/test_transpile.py::TestTranspile::test_recursion` | 0.886 | 1 | 1 | 100.0% |
+| 17 | 1358 | `tests/test_optimizer.py::TestOptimizer::test_optimize_correlated_all` | 0.686 | 1 | 0 | 0.0% |
+| 18 | 773 | `tests/dialects/test_snowflake.py::TestSnowflake::test_snowflake` | 0.662 | 1 | 0 | 0.0% |
+| 19 | 1434 | `tests/test_optimizer.py::TestOptimizer::test_simplify` | 0.596 | 3 | 3 | 100.0% |
+| 20 | 1561 | `tests/test_transpile.py::TestTranspile::test_serde` | 0.506 | 1 | 1 | 100.0% |
+
+### (3) Build-Time Test-Specific Expression Profiles (`expr_profiler.py` + `build_map.py` + `selector.py`)
+- **Build-time recording (pinned commit `eb11aec` only)**:
+  - `ProfilingMetaPathFinder` instruments single-op `ast.Compare` and `If`/`IfExp`/`While` branch test sites inside function bodies across `sqlglot/**/*.py` (excluding `sqlglot/typing/*.py` so bytecode checks in `test_typing.py` stay untouched; skipping walrus/yield/await).
+  - Records compact per-test per-site bitsets: `seen`, `false`, `true` (3-tuple for branch sites) plus `eq`, `is2eq_unsafe`, `eq2is_unsafe`, `order_unsafe` (7-tuple for Compare sites).
+  - Explicitly records `inactive_sids` (any site hit outside an active test, e.g., module import/collection time) and excludes all `746` import-time sites from `expr_profiles`.
+  - All `1,620` active tests + `25,440` subtests passed (`0` failures, `1` skipped, `missing=0, extra=0` vs `tests.json`).
+  - **Profile stats**: **7,427 profiled expression sites across 117 files** (746 import-time sites excluded).
+  - **Map size**: **`2.43 MB`** compressed (`2,433,531` bytes; `18.47 MB` raw pickle4) — only **`+0.19 MB`** above the `2.24 MB` v1 map. Total repo `.git + tracked` = **`7.50 MB`** (limit `20 MB`).
+- **Runtime soundness prover (`prove_unchanged_test_bits`)**:
+  - Applies ONLY when the entire commit modifies a single non-docs, non-AST-identical Python source file and differs at exactly one expression site inside a function body.
+  - Drops test `T` ONLY if `T`'s OWN recorded profile at that exact `(file, lineno, col_offset)` site proves every evaluation in `T` produces the identical result (by first-divergence induction):
+    - **P1** (`is`->`==`, `is not`->`!=`): `seen & ~is2eq_unsafe`
+    - **P2** (`==`->`is`, `!=`->`is not`): `seen & ~eq2is_unsafe` (rejects non-singleton equality even when interned)
+    - **P3** (`<`<->`<=`, `>`<->`>=`): `seen & ~order_unsafe & ~eq` (requires pure recursive primitive ordering and never equal)
+    - **P4** (`E`->`E and X`, or strictly-pure branch `E`->`False`): `seen & ~true`
+    - **P5** (`E`->`E or X`, or strictly-pure branch `E`->`True`): `seen & ~false`
+    - **P6** (strictly-pure `BoolOp` `and`<->`or` in branch context): `seen & ~false` (for `and`->`or`) or `seen & ~true` (for `or`->`and`)
+  - Any missing site profile, unseen test (`not in seen`), multi-site edit, or uncertainty keeps the test.
+- **Seconds recovered vs static baseline (30 samples)**:
+  - **Pure profiles (`verifier=off`) vs static+dict baseline (`162.412 s` sim / `163.503 s` total)**: **`52.777 s` simulated recovered** (`162.412 s -> 109.635 s`) for `+0.123 s` CPU = **`52.654 s` net** (**0 misses**).
+  - **Profiles + `single_cheap` vs static+dict baseline**: **`54.781 s` simulated / `54.261 s` net** (`163.503 s -> 109.242 s`, **0 misses**).
+  - **Profiles + `single_cheap` vs v1 static (`166.102 s`)**: **`57.734 s` simulated / `56.860 s` net** (`166.102 s -> 109.242 s`, **0 misses**).
+- **133-Edit Differential Test (`diff_test.py`)**:
+  - Extended `diff_test.py` to **133 synthetic edits** purely from pinned commit `eb11aec` (19 hand-crafted category/adversarial edits including the `if source is None:` -> `if source is None and False:` trap + 114 programmatically mined AST edits across `p1_is_to_eq`, `p2_eq_to_is`, `p3_order_flip`, `p4_and_false`, `p5_or_true`, `p6_boolop_flip`, and `side_effect_const`).
+  - **Result**: **`133` edits**, **`92` edits with drops**, **`1,023` dropped tests verified by real `pytest`** (`SKIP_INTEGRATION=0`, pytest 9 with subtests, `--timeout=180`), **`TOTAL WRONG DROPS: 0`**.
+  - On `cond_rare_source_none_trap` (`if source is None:` -> `if source is None and False:`): kept the exact 2 tests whose own profiles saw `True` (`test_qualify_columns`, `test_qualify_columns__invalid`) and dropped 74 tests whose profiles only ever saw `False` (all 74, including `test_execute_tpcds`, passed real `pytest`).
+  - Robustness suite (`tests/test_robustness.py`): **18/18 passed** under `python -S -E`.
+  - Compliance audit: **0** sample commit IDs in any tracked file.
+
 
 
 
