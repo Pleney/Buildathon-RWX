@@ -1,70 +1,56 @@
-# Blast Radius starter
+# Blast-Radius Test Selector for sqlglot
 
-A working submission for the Blast Radius track. It runs every test on every commit, so it never misses a failure and scores badly. Your job is to run less without missing.
+A containerised blast-radius test selector and worker packer for [sqlglot](https://github.com/tobymao/sqlglot) at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`.
 
-## The problem
+Given `/data/commits/<id>.patch` and `/data/tests.json`, the container prints one JSON line per commit on stdout:
 
-Your image gets a batch of code changes to [sqlglot](https://github.com/tobymao/sqlglot) at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. For each change, print which tests to run and how to split them across up to 8 workers.
-
-| | |
-| --- | --- |
-| `/data/commits/<id>.patch` | One unified diff against the pinned commit. Each stands alone: none builds on another. |
-| `/data/tests.json` | Every test, numbered, with its file and the seconds it took us to run. |
-| stdout | One JSON line a commit: `{"commit": "k7q2", "workers": [[12, 845, 901], [3, 77]]}` |
-
-Each inner list is one worker's test numbers. `"workers": []` runs nothing, which is the right answer for a change that breaks nothing.
-
-## Scoring
-
-Lower is better. [SCORING.md](SCORING.md) has the exact rules; in short:
-
-- A commit costs the recorded seconds of its busiest worker, plus 2 seconds for every worker.
-- A commit where you left out a test that fails adds 300 seconds.
-- The CPU seconds your program uses are added. Running sqlglot's tests while you decide is allowed, and you pay for the time.
-- Your image runs 3 times and the middle total counts.
-
-"Fails" means pytest reports a failure, an error or a timeout for the test, or the test's file cannot be imported. A test with subtests is one test: one failing subtest fails it.
-
-## Try it
-
-You need Docker, make and Python 3.9 or newer. The kit unpacks into the folder you are in, so unpack it into an empty one.
-
-```sh
-make sample   # build, run once on the 30 sample commits under the scorer's limits, and score
-make check    # the output's format only
+```json
+{"commit":"k7q2","workers":[[12,845,901],[3,77]]}
 ```
 
-`make sample` prints your simulated seconds and misses, which are exact for that output. The board adds the CPU seconds your container used and takes the middle of 3 runs, so expect it a little higher. Your program never sees `sample/answers.json`: only the patches and `tests.json` are mounted.
+selecting the tests that could be affected by each patch and packing them onto 1–8 workers to minimize `max(worker_load) + 2s * workers_used + CPU_time` while avoiding the 300 s miss penalty.
 
-`sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
+## Rules Compliance
 
-## Submit
+- **No patch-to-test lookup tables**: No sample patches, commit IDs, hashes, answers, or tables keyed by patch or edit kind exist anywhere in this repository or Docker image (`sample/` and `output.jsonl` are excluded via `.gitignore` and `.dockerignore`).
+- **Map derived strictly from the pinned commit**: `map.pkl.gz` is generated exclusively from sqlglot at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa` by running its own test suite under Python 3.13 `sys.monitoring` and static AST/import inspection (`build_map.py`). Test entries are keyed by pytest node ID and mapped dynamically to `/data/tests.json` numbers at runtime.
+- **No mutation testing**: No mutation-derived maps are used.
+- **Allowed sources only**: The runtime Docker build uses only the pinned `python:3.13-slim` base image from Docker Hub and files committed in this repository. Regenerating `map.pkl.gz` downloads only from PyPI (`requirements.lock`) and sqlglot at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`.
 
-Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.
+## Architecture
 
-## Rules
+| File | Role |
+| --- | --- |
+| `build_map.py` | Offline/build-stage map generator. Runs sqlglot's full suite (`SKIP_INTEGRATION=0`) inside the pinned `python:3.13-slim` environment with `sys.monitoring` (`LINE` + `PY_START`), `open()` fixture hooks, `Dialect`/`Expr` runtime hooks, `setUpClass` attribution, and IPC-pickling `_SyncExecutor` for `ProcessPoolExecutor` coverage. Emits `map.pkl.gz` (`pickle` protocol 4 + `zlib`). |
+| `map.pkl.gz` | Compact (~2.24 MB) commit-derived artifact storing per-test line/function/class/fixture/dialect/expression bitsets, static AST & import graphs, runtime MRO subclass hierarchy, and individually compressed base Python sources. |
+| `patch_parser.py` | Pure-stdlib unified diff parser, in-memory patch applier, file classifier, and Python AST/encoding diff analyzer. |
+| `selector.py` | Pure-stdlib runtime selector (`python -S -E`). Applies tiered blast-radius rules + cost-aware FR4 inclusion (`P(fail) * 300 > runtime / k`) with conservative fallbacks on syntax errors, config/Rust/`__init__.py`/unknown files, malformed patches, or internal errors. |
+| `packer.py` | Exact integer-millisecond worker packer choosing `k` in `1..8` via lower-bound pruning, LPT initialization, and move/1-1 swap local search. |
+| `eval.py` | Local evaluation and 3-fold (20/10) leave-some-out cross-validation script using `score.py`. |
+| `tests/test_robustness.py` | Standalone synthetic patch robustness suite (18 tests covering all file classes and edge cases). |
+| `Dockerfile` | Minimal runtime image on the pinned `python:3.13-slim` digest with precompiled `.pyc` readable by `nobody`. |
 
-- Submit your own team's repository. A submission with the same repository, commit or archive as another team's is disqualified, the later one.
-- Your build may download only from public package registries: PyPI, npm, Docker Hub, GitHub releases at a fixed tag, and sqlglot’s own repository at the pinned commit. Nothing from an address your team controls. The final rebuilds every image after the cutoff, so anything else could change a submission after the deadline.
-- No answers worked out ahead of time and looked up by patch: no table from a patch, or from a kind of edit, to the tests it breaks. Maps built from the pinned commit (coverage, imports, fixtures) are allowed. Top entries are read.
-- Only the final counts. The practice board carries no prize.
+## Usage
 
-## How your image runs
+### Build and run under exact scorer constraints
+```sh
+make sample   # build image, run on sample/ as nobody on read-only FS with --network none, and score
+make check    # format validation only
+```
 
-- The build has the network, 4 cores, 8 GB of memory and 10 minutes. It may clone sqlglot at the pinned commit, install it and run its tests to make coverage or import maps.
-- Your repository may hold 20 MB. Git submodules and Git LFS files are not fetched: clone sqlglot in the `Dockerfile` and commit maps as plain files.
-- The run has no network, 2 cores, 4 GB of memory and 3 minutes for the whole batch (4.5 in the final, which has about one and a half times as many commits).
-- The disk is read-only. `/tmp` holds 64 MB and is empty at the start of every run.
-- The container runs as user `nobody`, with `HOME=/tmp` and at most 256 processes.
-- stdout may hold 2 MB. More rejects the run.
+### Local evaluation & cross-validation
+```sh
+python eval.py --cv
+```
 
-## Things that will catch you
+### Robustness suite
+```sh
+python -S -E -m unittest discover -s tests -v
+```
 
-- Logs go to stderr. Any line on stdout that is not an answer rejects the run.
-- `score.py` names a broken rule by its code, as in `Rejected: not_json on line 1`. The table in SCORING.md says what each code means.
-- Files your program needs must be readable by `nobody`. A map written by `root` during the build with mode 600 is not.
-- pytest 9 prints a test as `PASSED` beside `SUBFAILED` lines when one of its subtests fails. That test failed.
-- sqlglot skips its executor tests unless `SKIP_INTEGRATION=0` is set. We labeled with it set, so those tests can fail.
-- `requirements.lock` is every package in the environment we labeled in, on the image the `Dockerfile` starts from. To run sqlglot's tests the way we did, `pip install -r requirements.lock` and put the sqlglot checkout on `PYTHONPATH`; sqlglot's own `pip install -e .[dev]` picks newer versions.
-- The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
-- A change that only adds a comment is not promised to be harmless.
+### Regenerating `map.pkl.gz` from scratch
+Inside a container built from `python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90` with `pip install -r requirements.lock`, `SKIP_INTEGRATION=0`, and sqlglot checked out at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa` at `/sqlglot`:
+
+```sh
+python build_map.py --sqlglot-dir /sqlglot --output /out/map.pkl.gz --workers 4
+```
