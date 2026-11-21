@@ -713,3 +713,417 @@ def analyze_python_change(old_bytes: bytes, new_bytes: bytes) -> PythonChangeAna
             res.changed_module_vars.append((name, dkeys))
 
     return res
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Commit-level equivalence (docstrings, alpha-equivalent local renames,
+#          unreferenced pure added public functions)
+# ---------------------------------------------------------------------------
+_UNSAFE_RENAME_NAMES: frozenset[str] = frozenset(
+    {
+        "locals",
+        "vars",
+        "eval",
+        "exec",
+        "dir",
+        "globals",
+        "super",
+        "inspect",
+        "_getframe",
+        "breakpoint",
+        "pdb",
+        "__class__",
+    }
+)
+_UNSAFE_RENAME_ATTRS: frozenset[str] = frozenset({"f_locals", "co_varnames", "_getframe"})
+
+
+def _is_docstring_stmt(stmt: ast.stmt) -> bool:
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+    )
+
+
+def _eq_without_docstrings(a: Any, b: Any) -> bool:
+    """Fast structural AST equality ignoring leading docstrings on Module, ClassDef,
+    FunctionDef, AsyncFunctionDef. Uses C-speed ast.dump short-circuiting."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        if _dump_node(a) == _dump_node(b):
+            return True
+        strip_doc = isinstance(a, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        if not strip_doc:
+            return False
+        for fname in a._fields:
+            va = getattr(a, fname)
+            vb = getattr(b, fname)
+            if fname == "body" and isinstance(va, list) and isinstance(vb, list):
+                if va and _is_docstring_stmt(va[0]):
+                    va = va[1:]
+                if vb and _is_docstring_stmt(vb[0]):
+                    vb = vb[1:]
+                if len(va) != len(vb):
+                    return False
+                for sa, sb in zip(va, vb):
+                    if not _eq_without_docstrings(sa, sb):
+                        return False
+            else:
+                if isinstance(va, ast.AST) and isinstance(vb, ast.AST):
+                    if _dump_node(va) != _dump_node(vb):
+                        return False
+                elif isinstance(va, list) and isinstance(vb, list):
+                    if len(va) != len(vb):
+                        return False
+                    for xa, xb in zip(va, vb):
+                        if isinstance(xa, ast.AST) and isinstance(xb, ast.AST):
+                            if _dump_node(xa) != _dump_node(xb):
+                                return False
+                        elif xa != xb:
+                            return False
+                elif va != vb:
+                    return False
+        return True
+    return a == b
+
+
+def _find_node_by_qualname(tree: ast.AST, qualname: str) -> ast.AST | None:
+    parts = qualname.split(".")
+    cur_body: list[ast.stmt] = getattr(tree, "body", [])
+    for idx, part in enumerate(parts):
+        matches = [
+            st
+            for st in cur_body
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and st.name == part
+        ]
+        if len(matches) != 1:
+            return None
+        found = matches[0]
+        if idx == len(parts) - 1:
+            return found
+        cur_body = getattr(found, "body", [])
+    return None
+
+
+def is_docstring_only_change(
+    old_tree: ast.AST,
+    new_tree: ast.AST,
+    ana: PythonChangeAnalysis | None = None,
+) -> bool:
+    """Return True iff `old_tree` and `new_tree` differ ONLY in module/class/function
+    docstrings (and nowhere else in executable code, signatures, or literals)."""
+    if ana is not None:
+        if (
+            ana.changed_imports
+            or ana.changed_all
+            or ana.added_or_removed_public_names
+            or ana.changed_class_attrs
+            or ana.changed_module_vars
+        ):
+            return False
+        # Fast targeted check when only existing functions changed (avoids dumping whole file!)
+        if ana.changed_funcs and not ana.changed_class_headers and not ana.changed_other_module_code:
+            for fq in ana.changed_funcs:
+                of = _find_node_by_qualname(old_tree, fq)
+                nf = _find_node_by_qualname(new_tree, fq)
+                if not isinstance(of, (ast.FunctionDef, ast.AsyncFunctionDef)) or not isinstance(
+                    nf, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    return False
+                if ast.get_docstring(of, clean=False) == ast.get_docstring(nf, clean=False):
+                    return False
+                if not _eq_without_docstrings(of, nf):
+                    return False
+            return True
+    return _eq_without_docstrings(old_tree, new_tree)
+
+
+def _param_names(args: ast.arguments) -> set[str]:
+    names: set[str] = set()
+    for a in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+        names.add(a.arg)
+    if args.vararg:
+        names.add(args.vararg.arg)
+    if args.kwarg:
+        names.add(args.kwarg.arg)
+    return names
+
+
+def _analyze_func_scope_for_rename(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[set[str], set[str], set[str]] | None:
+    """Return `(params, bound_locals, free_names)` for `fn`, or `None` if `fn` uses
+    any feature that makes purely local alpha-renaming unsafe."""
+    params = _param_names(fn.args)
+    bound_locals: set[str] = set()
+    all_loaded: set[str] = set()
+
+    for node in ast.walk(fn):
+        if node is fn:
+            continue
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.Lambda,
+                ast.Global,
+                ast.Nonlocal,
+                ast.Import,
+                ast.ImportFrom,
+                ast.Match,
+            ),
+        ):
+            return None
+        if isinstance(node, ast.Name):
+            if node.id in _UNSAFE_RENAME_NAMES:
+                return None
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                if node.id not in params:
+                    bound_locals.add(node.id)
+            elif isinstance(node.ctx, ast.Load):
+                all_loaded.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _UNSAFE_RENAME_ATTRS:
+                return None
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            if node.name in _UNSAFE_RENAME_NAMES:
+                return None
+            if node.name not in params:
+                bound_locals.add(node.name)
+
+    free_names = all_loaded - params - bound_locals
+    return params, bound_locals, free_names
+
+
+def _funcs_alpha_equivalent(
+    old_fn: ast.FunctionDef | ast.AsyncFunctionDef,
+    new_fn: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    """Return True iff `old_fn` and `new_fn` have identical signatures, decorators,
+    return annotations, and docstrings, and their bodies are strictly alpha-equivalent
+    under a bijection on purely local (non-parameter, non-free) variable names."""
+    if type(old_fn) is not type(new_fn) or old_fn.name != new_fn.name:
+        return False
+    if _dump_node(old_fn.args) != _dump_node(new_fn.args):
+        return False
+    if [_dump_node(d) for d in old_fn.decorator_list] != [_dump_node(d) for d in new_fn.decorator_list]:
+        return False
+    if (old_fn.returns is None) != (new_fn.returns is None):
+        return False
+    if old_fn.returns is not None and new_fn.returns is not None and _dump_node(old_fn.returns) != _dump_node(new_fn.returns):
+        return False
+    if ast.get_docstring(old_fn, clean=False) != ast.get_docstring(new_fn, clean=False):
+        return False
+    if len(old_fn.body) != len(new_fn.body):
+        return False
+
+    info_a = _analyze_func_scope_for_rename(old_fn)
+    info_b = _analyze_func_scope_for_rename(new_fn)
+    if info_a is None or info_b is None:
+        return False
+    params_a, locals_a, free_a = info_a
+    params_b, locals_b, free_b = info_b
+    if params_a != params_b or free_a != free_b:
+        return False
+
+    locked = params_a | free_a
+    old_to_new: dict[str, str] = {}
+    new_to_old: dict[str, str] = {}
+
+    def map_var(a_name: str, b_name: str) -> bool:
+        if a_name in locked or b_name in locked:
+            return a_name == b_name
+        if a_name != b_name:
+            if a_name not in locals_a or b_name not in locals_b:
+                return False
+        prev_b = old_to_new.get(a_name)
+        if prev_b is not None and prev_b != b_name:
+            return False
+        prev_a = new_to_old.get(b_name)
+        if prev_a is not None and prev_a != a_name:
+            return False
+        old_to_new[a_name] = b_name
+        new_to_old[b_name] = a_name
+        return True
+
+    def eq_ast(a: Any, b: Any) -> bool:
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.Name):
+            if type(a.ctx) is not type(b.ctx):
+                return False
+            return map_var(a.id, b.id)
+        if isinstance(a, ast.ExceptHandler):
+            if (a.name is None) != (b.name is None):
+                return False
+            if a.name is not None and b.name is not None and not map_var(a.name, b.name):
+                return False
+            if not eq_ast(a.type, b.type):
+                return False
+            return eq_ast(a.body, b.body)
+        if isinstance(a, ast.AST):
+            for fname in a._fields:
+                if not eq_ast(getattr(a, fname), getattr(b, fname)):
+                    return False
+            return True
+        if isinstance(a, list):
+            if len(a) != len(b):
+                return False
+            return all(eq_ast(x, y) for x, y in zip(a, b))
+        return a == b
+
+    return eq_ast(old_fn.body, new_fn.body)
+
+
+def is_safe_local_rename(
+    old_tree: ast.AST,
+    new_tree: ast.AST,
+    ana: PythonChangeAnalysis | None = None,
+) -> bool:
+    """Return True iff `old_tree` and `new_tree` are identical everywhere except for
+    strictly alpha-equivalent local-variable renames inside existing function/method bodies."""
+    if ana is not None:
+        if (
+            not ana.changed_funcs
+            or ana.changed_class_headers
+            or ana.changed_class_attrs
+            or ana.changed_module_vars
+            or ana.changed_imports
+            or ana.changed_all
+            or ana.added_or_removed_public_names
+            or ana.changed_other_module_code
+        ):
+            return False
+        for fq in ana.changed_funcs:
+            of = _find_node_by_qualname(old_tree, fq)
+            nf = _find_node_by_qualname(new_tree, fq)
+            if not isinstance(of, (ast.FunctionDef, ast.AsyncFunctionDef)) or not isinstance(
+                nf, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                return False
+            if not _funcs_alpha_equivalent(of, nf):
+                return False
+        return True
+
+    def eq_top(a: Any, b: Any) -> bool:
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.AST):
+            if _dump_node(a) == _dump_node(b):
+                return True
+            if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return _funcs_alpha_equivalent(a, b)
+            if not isinstance(a, (ast.Module, ast.ClassDef)):
+                return False
+            for fname in a._fields:
+                if not eq_top(getattr(a, fname), getattr(b, fname)):
+                    return False
+            return True
+        if isinstance(a, list):
+            if len(a) != len(b):
+                return False
+            return all(eq_top(x, y) for x, y in zip(a, b))
+        return a == b
+
+    return eq_top(old_tree, new_tree)
+
+
+def _has_future_annotations(tree: ast.AST) -> bool:
+    for st in getattr(tree, "body", ()):
+        if isinstance(st, ast.ImportFrom) and st.module == "__future__":
+            if any(a.name == "annotations" for a in st.names):
+                return True
+    return False
+
+
+def _is_pure_literal_expr(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Not)):
+        return isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float, bool))
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_is_pure_literal_expr(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(k is not None and _is_pure_literal_expr(k) and _is_pure_literal_expr(v) for k, v in zip(node.keys, node.values))
+    return False
+
+
+def _func_has_any_annotations(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    if fn.returns is not None:
+        return True
+    args = fn.args
+    for a in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+        if a.annotation is not None:
+            return True
+    if args.vararg and args.vararg.annotation is not None:
+        return True
+    if args.kwarg and args.kwarg.annotation is not None:
+        return True
+    return False
+
+
+def find_safe_added_public_funcs(
+    old_tree: ast.AST,
+    new_tree: ast.AST,
+    added_or_removed: list[str],
+) -> set[str] | None:
+    """If EVERY name in `added_or_removed` is a strictly ADDED, undecorated,
+    import-time-pure top-level FunctionDef/AsyncFunctionDef (not a ClassDef or var,
+    no removed names, pure literal defaults, no eagerly evaluated annotations),
+    return the set of added function names. Otherwise return None."""
+    if not added_or_removed:
+        return None
+
+    old_names: set[str] = set()
+    for st in getattr(old_tree, "body", ()):
+        k = _stmt_key(st)
+        if k is not None and k[0] != "import":
+            old_names.add(k[1])
+
+    new_funcs: dict[str, list[ast.stmt]] = {}
+    new_non_funcs: set[str] = set()
+    for st in getattr(new_tree, "body", ()):
+        k = _stmt_key(st)
+        if k is None or k[0] == "import":
+            continue
+        if k[0] == "func":
+            new_funcs.setdefault(k[1], []).append(st)
+        else:
+            new_non_funcs.add(k[1])
+
+    future_ann = _has_future_annotations(new_tree)
+    safe_added: set[str] = set()
+
+    for nm in added_or_removed:
+        # Must be strictly ADDED (not present in old_tree)
+        if nm in old_names:
+            return None
+        # Must NOT also be a class or var
+        if nm in new_non_funcs:
+            return None
+        flist = new_funcs.get(nm)
+        if not flist or len(flist) != 1:
+            return None
+        fn = flist[0]
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        # Decorators run at import time -> reject
+        if fn.decorator_list:
+            return None
+        # Without `from __future__ import annotations`, annotations run at import time -> reject
+        if not future_ann and _func_has_any_annotations(fn):
+            return None
+        # Default arg expressions run at import time -> require pure literals
+        for d in fn.args.defaults:
+            if not _is_pure_literal_expr(d):
+                return None
+        for d in fn.args.kw_defaults:
+            if d is not None and not _is_pure_literal_expr(d):
+                return None
+        safe_added.add(nm)
+
+    return safe_added
