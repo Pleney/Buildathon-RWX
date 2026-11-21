@@ -15,7 +15,7 @@ pathlib.Path('/tmp/sg.tar.gz').unlink()" \
     && rm -f /tmp/requirements.lock
 
 WORKDIR /app
-COPY selector.py patch_parser.py packer.py expr_profiler.py verifier.py map.pkl.gz /app/
+COPY selector.py patch_parser.py packer.py expr_profiler.py verifier.py map.pkl.gz profiles.pkl.gz /app/
 
 # Precompile bytecode for both /app and /sqlglot inside the target Python 3.13 image
 # and ensure world-readable permissions for user `nobody` (65534:65534) on read-only FS.

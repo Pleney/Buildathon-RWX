@@ -1,0 +1,24 @@
+# Overnight Progress Log (Asia/Singapore Time)
+
+- **2026-11-22 03:28 SGT** — Started unattended overnight run (feature freeze: **10:30 SGT**). Created branch `work` from `main` (`2a3d3cbec3ca15d7df268b30ff6ed7b509c1a50b`).
+- **2026-11-22 03:31 SGT** — Safety infrastructure built:
+  - Split `map.pkl.gz` (`2.24 MB`, frozen static+coverage) and `profiles.pkl.gz` (`0.21 MB`, mutable profile tables) so only `profiles.pkl.gz` changes across phases.
+  - Added per-phase toggle env vars (`BLAST_P1_REACH`, `BLAST_P1_MULTISITE`, `BLAST_P1_ROOT_INIT`, `BLAST_P2_MAPPINGS`, `BLAST_P3_EQUIV`, `BLAST_P4_RANGES`, `BLAST_VERIFIER_MODE=off` default).
+  - Updated `.gitignore` and `.dockerignore` for caches/logs/JSON reports/gate scratch.
+  - Added `--quick` (~33 edits) and deterministic 20% `--split holdout|dev` to `diff_test.py` with hard 300 s process-group timeout.
+  - Created `gate.sh` + `gate_runner.py`, `CANDIDATES.md`, `LATEST_SAFE.txt`, `PROGRESS.md`.
+- **Phase 0 (no tests)** — Already inspected all 8 covered-but-passing sample commits (`sample_01`, `03`, `06`, `08`, `09`, `22`, `23`, `26`):
+  - **Finding**: All 8 are single-line generated mutations (`is->==`, `<->=`, `16->17`, `False->True`, `==->!=`).
+  - **3 of the 5 remaining passing sample commits (`sample_06` `NUMERIC_ESCAPES`, `sample_23` `SHOW_PARSERS`, `sample_26` `TriggerProperties.arg_types` = `10.16 s` = 69% of remaining sample gap)** are single-key mutations inside class-level dicts where no test looked up that key!
+  - **Phase ordering decision (evidence-backed)**: Keep Phase 1 (sub-expression reachability + multi-site conjunction + `__init__.py` function-body scoping + optimized/stability-verified single-process profiling) FIRST so the fast, stability-checked single-process profiler foundation is rock-solid; immediately follow with Phase 2 (mapping-key lookup profiles, extended to BOTH `Dialect/Tokenizer/Parser/Generator` dicts AND `Expression.arg_types`!), then Phase 3 (commit-level equivalence), then Phase 4 (numeric ranges / constant sets / defaults), Phase 5 (broader evaluation + hold-out), Phase 6 (hygiene + morning report).
+- **Next step**: Verify `gate.sh` passes on baseline Safety Infrastructure (ETA ~2 min), then begin Phase 1.
+- **2026-11-22 03:35 SGT** — Baseline `gate.sh` **PASS**: `sim=109.635s cpu=1.190s total=110.825s misses=0 diff_wrong=0 build=45.7s batch15x=2.1s art=2.45MB repo=10.06MB` (`gate_wall=226.4s`). Committed safety infrastructure on `work` (`5e49802`).
+- **2026-11-22 03:40 SGT** — Phase 1 `compare_probe` hot-path verification:
+  - Discovered observer-effect / re-entrancy bug in original `compare_probe` (probe-internal `lhs == rhs` re-entered instrumented `Expr.__eq__`/`__hash__` and `_Dialect.__eq__`, causing 7 site mismatches and 36-min `test_execute_tpcds`).
+  - Added `in_probe` re-entrancy guard + fast paths for `None`/reflexive/mismatched-`Expr`/reused-`res` -> verified **0 site mismatches** (bit-identical across 3,008 sites & 60 tests) and cut `test_execute_tpcds` from `2,154 s` to `58.4 s` (**37x speedup**!).
+- **2026-11-22 03:56 SGT** — First Phase 1 2x single-process stability build (`build_profiles.py`): Run 1 `279.1 s`, Run 2 `277.1 s`, 1,620 passed / 0 failed / 0 unstable sites across 7,579 expr + 6,028 reach sites (`profiles.pkl.gz = 0.30 MB`). Broader-set evaluation (162 edits): gap dropped `294.271 s -> 186.424 s` (`-107.846 s`, 0 misses; hold-out `-4.092 s`, 0 misses).
+- **2026-11-22 04:07 SGT** — First Phase 1 `gate.sh` caught **FAIL** (`diff_quick_wrong_drops=132`), exposing 3 exact issues BEFORE merging:
+  1. `p1_root_init_func_break` (`129` wrong drops): `parse_one()` in `sqlglot/__init__.py` runs at module import time when dialects load; breaking it crashes imports for tests that never call `parse_one` inside their own test body. Fixed by recording `import_time_funcs` during build and keeping `all_map_bits` whenever any changed `root_init` function runs at import time.
+  2. `p1_short_circuit_ifexp` (`1` wrong drop: `TestAthena::test_tokenizer_errors`): `IfExp` and `IfExp.body` share the same `(lineno, col_offset)` (`(106, 19)`), causing `anc_sites` to collide with `IfExp.body`'s reach bitset! Fixed permanently by keying both `expr_profiles` and `reach_profiles` by full 4-tuple spans `(lineno, col_offset, end_lineno, end_col_offset)`.
+  3. `p1_is_to_eq_01___init___L197` (`1` false-positive wrong drop: `TestExasol::test_json` actually PASSED in 0.30 s!): `diff_test.py`'s output parser matched SQL `ERROR ON ERROR` inside a `SUBPASSED` line. Fixed parser to ignore `PASSED`/`SUBPASSED` lines and match strict pytest status tokens.
+- **2026-11-22 04:14 SGT** — Rebuilding 2x stability-checked `profiles.pkl.gz` with 4-tuple spans + `import_time_funcs` (`task-872`, ETA ~9 min), then re-running `gate.sh` for **CHECKPOINT 1**.
