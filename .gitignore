@@ -1,0 +1,15 @@
+# Never commit sample patches, answers, or test run outputs (competition rules)
+sample/
+output.jsonl
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+
+# Temporary local build / scratch dirs
+build_tmp/
+sqlglot_src/
+*.tmp
