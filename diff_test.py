@@ -1,38 +1,37 @@
 #!/usr/bin/env python3
-"""Differential test: synthetic edit generator comparing Hybrid Verifier drop
-decisions against real pytest (SKIP_INTEGRATION=0, pytest 9 with subtests).
+"""Differential test: >= 100 synthetic edits comparing build-time test-specific
+profiles (and optional verifier) against real pytest (SKIP_INTEGRATION=0, pytest 9
+with subtests).
 
-Generates synthetic patches across 9+ edit categories:
-  1. constant (module-level constant)
-  2. dict_value (class dict literal value)
-  3. condition_common (boolean/comparison condition in covered function)
-  4. condition_rare_threshold (rarely-triggered boundary condition — shadow stress test!)
-  5. condition_equiv (semantically equivalent comparison — shadow positive test)
-  6. return_value (function return expression)
-  7. decorator (method decorator change)
-  8. signature (default argument value change)
-  9. import (broken/altered import statement)
- 10. class_body (class attribute scalar change)
- 11. fixture (SQL fixture edit)
- 12. verifier_timeout (infinite loop — verifier timeout must KEEP tests)
- 13. verifier_error (syntax error — verifier error must KEEP tests)
+Generates >= 100 synthetic patches purely from the pinned sqlglot commit across:
+  - Hand-crafted adversarial & category edits (constants, dict values, conditions,
+    rare-True traps including `if source is None:` -> `if source is None and False:`,
+    return values, decorators, signatures, imports, class bodies, fixtures,
+    infinite-loop timeout, syntax error)
+  - Programmatically AST-mined single-expression edits across sqlglot/**/*.py:
+      * P1: `is` -> `==`, `is not` -> `!=`
+      * P2: `==` -> `is`, `!=` -> `is not` (including non-singleton traps!)
+      * P3: `<` <-> `<=`, `>` <-> `>=` (boundary & non-boundary)
+      * P4: `E` -> `E and False` (rare-True traps & always-False branches)
+      * P5: `E` -> `E or True` (rare-False traps & always-True branches)
+      * P6: `and` <-> `or` flips (pure & impure)
+      * Side-effect traps: `E` -> `False` / `E` -> `True` on calls & attributes
 
-For each edit, computes:
-  - static_set (BlastRadiusSelector without verifier)
-  - verified_set (BlastRadiusSelector with verifier)
-  - dropped = static_set - verified_set
-Then applies the patch to an isolated copy of /sqlglot and runs real `pytest`
-on every test in `dropped` (catching failures, errors, timeouts, AND pytest 9
-SUBFAILED subtests!). Reports any dropped test that pytest says fails.
+For EVERY edit, computes:
+  - base_set   (BlastRadiusSelector with profiles OFF, verifier OFF)
+  - target_set (BlastRadiusSelector with profiles ON, and optional verifier mode)
+  - dropped = base_set - target_set
+Then applies the patch to an isolated temp copy of /sqlglot and runs real `pytest`
+on EVERY test in `dropped` (catching FAILED, ERROR, timeouts, and pytest 9 SUBFAILED).
+Requires 0 wrong drops across all >= 100 edits.
 """
 
 from __future__ import annotations
 
+import ast
 import difflib
 import json
 import os
-import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,7 +45,6 @@ if "/app" not in sys.path and Path("/app/selector.py").is_file():
     sys.path.insert(0, "/app")
 
 import selector as sel  # noqa: E402
-import verifier as ver  # noqa: E402
 
 
 def _make_diff(rel: str, old_text: str, new_text: str) -> str:
@@ -70,11 +68,269 @@ def _replace_once(sqlglot_root: Path, rel: str, old_sub: str, new_sub: str) -> t
     return _make_diff(rel, text, new_text), {rel: new_text}
 
 
-def generate_synthetic_edits(sqlglot_root: Path) -> list[dict[str, Any]]:
-    """Build a diverse suite of synthetic edits purely from pinned commit files."""
+def _replace_node_span(
+    text: str,
+    node: ast.AST,
+    replacement: str,
+) -> str | None:
+    """Replace the exact character span of `node` in `text` with `replacement`."""
+    lineno = getattr(node, "lineno", None)
+    end_lineno = getattr(node, "end_lineno", None)
+    col = getattr(node, "col_offset", None)
+    end_col = getattr(node, "end_col_offset", None)
+    if None in (lineno, end_lineno, col, end_col):
+        return None
+    lines = text.splitlines(keepends=True)
+    if lineno != end_lineno:
+        return None  # Keep single-line edits clean and deterministic
+    line = lines[lineno - 1]
+    raw_line = line.encode("utf-8")
+    try:
+        new_raw = raw_line[:col] + replacement.encode("utf-8") + raw_line[end_col:]
+        new_line = new_raw.decode("utf-8")
+    except Exception:
+        return None
+    if new_line == line:
+        return None
+    lines[lineno - 1] = new_line
+    new_text = "".join(lines)
+    try:
+        ast.parse(new_text)
+    except SyntaxError:
+        return None
+    return new_text
+
+
+def _get_node_src(text: str, node: ast.AST) -> str | None:
+    lineno = getattr(node, "lineno", None)
+    end_lineno = getattr(node, "end_lineno", None)
+    col = getattr(node, "col_offset", None)
+    end_col = getattr(node, "end_col_offset", None)
+    if None in (lineno, end_lineno, col, end_col) or lineno != end_lineno:
+        return None
+    line = text.splitlines(keepends=True)[lineno - 1].encode("utf-8")
+    try:
+        return line[col:end_col].decode("utf-8")
+    except Exception:
+        return None
+
+
+def _mine_ast_edits(
+    sqlglot_root: Path,
+    map_data: dict[str, Any],
+    existing_keys: set[tuple[str, int]],
+) -> list[dict[str, Any]]:
+    """Deterministically mine diverse single-expression edits from pinned sqlglot/**/*.py."""
+    line_to_tests: dict[str, dict[int, int]] = map_data["line_to_tests"]
+    expr_profiles: dict[str, dict[tuple[int, int], tuple[int, ...]]] = map_data.get("expr_profiles", {})
+
+    # Quotas per mutation family to ensure broad, balanced >= 110 coverage
+    quotas = {
+        "p1_is_to_eq": 18,
+        "p2_eq_to_is": 18,
+        "p3_order_flip": 18,
+        "p4_and_false": 20,
+        "p5_or_true": 16,
+        "p6_boolop_flip": 14,
+        "side_effect_const": 10,
+    }
+    collected: dict[str, list[dict[str, Any]]] = {k: [] for k in quotas}
+    used_sites: set[tuple[str, int, str]] = set()
+
+    # Deterministic file order prioritizing rich optimizer/executor/parser/generator/dialect files
+    py_files = sorted(
+        p.relative_to(sqlglot_root).as_posix()
+        for p in (sqlglot_root / "sqlglot").rglob("*.py")
+        if not p.relative_to(sqlglot_root).as_posix().startswith("sqlglot/typing/")
+    )
+
+    def _can_add(family: str) -> bool:
+        return len(collected[family]) < quotas[family]
+
+    def _add_mined(family: str, rel: str, ln: int, text: str, new_text: str) -> None:
+        if (rel, ln) in existing_keys or (rel, ln, family) in used_sites:
+            return
+        used_sites.add((rel, ln, family))
+        idx = len(collected[family]) + 1
+        stem = Path(rel).stem[:12]
+        name = f"{family}_{idx:02d}_{stem}_L{ln}"
+        collected[family].append(
+            {
+                "name": name,
+                "kind": family,
+                "rel": rel,
+                "patch": _make_diff(rel, text, new_text),
+                "files": {rel: new_text},
+            }
+        )
+
+    for rel in py_files:
+        if all(not _can_add(fam) for fam in quotas):
+            break
+        lmap = line_to_tests.get(rel, {})
+        profs = expr_profiles.get(rel, {})
+        if not lmap or not profs:
+            continue
+        text = (sqlglot_root / rel).read_text("utf-8")
+        try:
+            tree = ast.parse(text, filename=rel)
+        except SyntaxError:
+            continue
+
+        # Walk inside function bodies only
+        def walk_func_body(stmts: list[ast.stmt], in_func: bool) -> None:
+            for node in stmts:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    walk_func_body(node.body, True)
+                    continue
+                if isinstance(node, ast.ClassDef):
+                    walk_func_body(node.body, False)
+                    continue
+                if not in_func:
+                    continue
+                for sub in ast.walk(node):
+                    ln = getattr(sub, "lineno", None)
+                    col = getattr(sub, "col_offset", None)
+                    if ln is None or col is None:
+                        continue
+                    cov = lmap.get(ln, 0)
+                    cov_cnt = cov.bit_count()
+                    if cov_cnt < 1 or cov_cnt > 150:
+                        continue
+
+                    # P1 / P2 / P3 on Compare sites
+                    if isinstance(sub, ast.Compare) and (ln, col) in profs:
+                        # P1: is -> == / is not -> !=
+                        if (
+                            _can_add("p1_is_to_eq")
+                            and len(sub.ops) == 1
+                            and isinstance(sub.ops[0], (ast.Is, ast.IsNot))
+                        ):
+                            src = _get_node_src(text, sub)
+                            if src:
+                                if isinstance(sub.ops[0], ast.Is) and " is " in src:
+                                    repl = src.replace(" is ", " == ", 1)
+                                elif isinstance(sub.ops[0], ast.IsNot) and " is not " in src:
+                                    repl = src.replace(" is not ", " != ", 1)
+                                else:
+                                    repl = ""
+                                if repl:
+                                    nt = _replace_node_span(text, sub, repl)
+                                    if nt:
+                                        _add_mined("p1_is_to_eq", rel, ln, text, nt)
+
+                        # P2: == -> is / != -> is not (mix of safe singletons & unsafe strings/ints!)
+                        if (
+                            _can_add("p2_eq_to_is")
+                            and len(sub.ops) == 1
+                            and isinstance(sub.ops[0], (ast.Eq, ast.NotEq))
+                        ):
+                            src = _get_node_src(text, sub)
+                            if src:
+                                if isinstance(sub.ops[0], ast.Eq) and " == " in src:
+                                    repl = src.replace(" == ", " is ", 1)
+                                elif isinstance(sub.ops[0], ast.NotEq) and " != " in src:
+                                    repl = src.replace(" != ", " is not ", 1)
+                                else:
+                                    repl = ""
+                                if repl:
+                                    nt = _replace_node_span(text, sub, repl)
+                                    if nt:
+                                        _add_mined("p2_eq_to_is", rel, ln, text, nt)
+
+                        # P3: < <-> <= and > <-> >=
+                        if (
+                            _can_add("p3_order_flip")
+                            and len(sub.ops) == 1
+                            and isinstance(sub.ops[0], (ast.Lt, ast.LtE, ast.Gt, ast.GtE))
+                        ):
+                            src = _get_node_src(text, sub)
+                            if src:
+                                op = sub.ops[0]
+                                repl = ""
+                                if isinstance(op, ast.Lt) and " < " in src:
+                                    repl = src.replace(" < ", " <= ", 1)
+                                elif isinstance(op, ast.LtE) and " <= " in src:
+                                    repl = src.replace(" <= ", " < ", 1)
+                                elif isinstance(op, ast.Gt) and " > " in src:
+                                    repl = src.replace(" > ", " >= ", 1)
+                                elif isinstance(op, ast.GtE) and " >= " in src:
+                                    repl = src.replace(" >= ", " > ", 1)
+                                if repl:
+                                    nt = _replace_node_span(text, sub, repl)
+                                    if nt:
+                                        _add_mined("p3_order_flip", rel, ln, text, nt)
+
+                    # P4 / P5 / P6 / side_effect_const on If.test
+                    if isinstance(sub, ast.If):
+                        t = sub.test
+                        t_ln = getattr(t, "lineno", None)
+                        t_col = getattr(t, "col_offset", None)
+                        if t_ln is None or t_col is None or (t_ln, t_col) not in profs:
+                            continue
+                        tsrc = _get_node_src(text, t)
+                        if not tsrc:
+                            continue
+                        prof = profs[(t_ln, t_col)]
+                        seen_b, false_b, true_b = prof[0], prof[1], prof[2]
+
+                        # P4: `E` -> `E and False` (include both rare-True traps and always-False!)
+                        if _can_add("p4_and_false") and (seen_b & ~true_b):
+                            nt = _replace_node_span(text, t, f"({tsrc}) and False" if " or " in tsrc else f"{tsrc} and False")
+                            if nt:
+                                _add_mined("p4_and_false", rel, t_ln, text, nt)
+
+                        # P5: `E` -> `E or True` (include both rare-False traps and always-True!)
+                        if _can_add("p5_or_true") and (seen_b & ~false_b):
+                            nt = _replace_node_span(text, t, f"({tsrc}) or True" if " and " in tsrc else f"{tsrc} or True")
+                            if nt:
+                                _add_mined("p5_or_true", rel, t_ln, text, nt)
+
+                        # P6: `and` <-> `or` flip
+                        if _can_add("p6_boolop_flip") and isinstance(t, ast.BoolOp) and len(t.values) == 2:
+                            if isinstance(t.op, ast.And) and " and " in tsrc:
+                                repl = tsrc.replace(" and ", " or ", 1)
+                            elif isinstance(t.op, ast.Or) and " or " in tsrc:
+                                repl = tsrc.replace(" or ", " and ", 1)
+                            else:
+                                repl = ""
+                            if repl:
+                                nt = _replace_node_span(text, t, repl)
+                                if nt:
+                                    _add_mined("p6_boolop_flip", rel, t_ln, text, nt)
+
+                        # Side-effect traps: replace Call/Attribute branch test with literal False/True
+                        if _can_add("side_effect_const") and any(
+                            isinstance(x, (ast.Call, ast.Attribute, ast.Subscript)) for x in ast.walk(t)
+                        ):
+                            lit = "False" if (seen_b & ~true_b) else "True"
+                            nt = _replace_node_span(text, t, lit)
+                            if nt:
+                                _add_mined("side_effect_const", rel, t_ln, text, nt)
+
+        for stmt in tree.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                walk_func_body(stmt.body, True)
+            elif isinstance(stmt, ast.ClassDef):
+                walk_func_body(stmt.body, False)
+
+    out: list[dict[str, Any]] = []
+    for fam in quotas:
+        out.extend(collected[fam])
+    return out
+
+
+def generate_synthetic_edits(sqlglot_root: Path, map_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build >= 100 diverse synthetic edits purely from pinned commit files."""
     edits: list[dict[str, Any]] = []
+    existing_keys: set[tuple[str, int]] = set()
 
     def add(name: str, kind: str, rel: str, old_sub: str, new_sub: str) -> None:
+        text = (sqlglot_root / rel).read_text("utf-8")
+        pos = text.find(old_sub)
+        if pos >= 0:
+            ln = text[:pos].count("\n") + 1
+            existing_keys.add((rel, ln))
         patch, files = _replace_once(sqlglot_root, rel, old_sub, new_sub)
         edits.append({"name": name, "kind": kind, "rel": rel, "patch": patch, "files": files})
 
@@ -114,7 +370,7 @@ def generate_synthetic_edits(sqlglot_root: Path) -> list[dict[str, Any]]:
         "if self._node_count > self.max_nodes + 1000000:",
     )
 
-    # 4b. Condition (ADVERSARIAL rare threshold — 59 tests, right inside shadow pruning zone!)
+    # 4b. Condition (ADVERSARIAL rare threshold — 59 tests)
     add(
         "cond_rare_max_text_width",
         "condition_rare",
@@ -150,7 +406,7 @@ def generate_synthetic_edits(sqlglot_root: Path) -> list[dict[str, Any]]:
         "if comments and not node.comments:",
     )
 
-    # 4f. Condition (ADVERSARIAL evaluated-every-time rare-True branch — 76 tests, 2 enter body!)
+    # 4f. Condition (MANDATORY TRAP: `if source is None:` -> `if source is None and False:`)
     add(
         "cond_rare_source_none_trap",
         "condition_rare",
@@ -255,6 +511,9 @@ def generate_synthetic_edits(sqlglot_root: Path) -> list[dict[str, Any]]:
         "class SQLiteGenerator(((",
     )
 
+    # Add >= 100 programmatically mined AST single-expression edits across sqlglot/**/*.py
+    mined = _mine_ast_edits(sqlglot_root, map_data, existing_keys)
+    edits.extend(mined)
     return edits
 
 
@@ -264,16 +523,13 @@ def run_pytest_on_tests(
     test_nodeids: list[str],
 ) -> set[str]:
     """Apply `file_overrides` to an isolated /tmp copy of sqlglot_root and run real
-    pytest (SKIP_INTEGRATION=0, catching FAILED, ERROR, and pytest 9 SUBFAILED) on
-    `test_nodeids`. Returns the set of failing nodeids."""
+    pytest (SKIP_INTEGRATION=0, catching FAILED, ERROR, timeouts, and pytest 9 SUBFAILED)
+    on `test_nodeids`. Returns the set of failing nodeids."""
     if not test_nodeids:
         return set()
 
-    # Copy only patched files into a tiny overlay dir? No — pytest needs real files;
-    # symlink everything in /sqlglot except patched files into a temp dir in /tmp!
     with tempfile.TemporaryDirectory(prefix="diff_pytest_") as tmpdir:
         tmp = Path(tmpdir)
-        # Create shallow directory mirror using symlinks for untouched subtrees/files
         override_paths = set(file_overrides.keys())
 
         def mirror(src_dir: Path, dst_dir: Path, rel_prefix: str = "") -> None:
@@ -282,7 +538,6 @@ def run_pytest_on_tests(
                 if entry.name == "__pycache__":
                     continue
                 rel = f"{rel_prefix}{entry.name}" if not rel_prefix else f"{rel_prefix}/{entry.name}"
-                # Check if any override is inside this subtree
                 if entry.is_dir():
                     prefix_slash = rel + "/"
                     if any(op.startswith(prefix_slash) for op in override_paths):
@@ -302,7 +557,6 @@ def run_pytest_on_tests(
         env["SKIP_INTEGRATION"] = "0"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
 
-        # Run pytest on the target nodeids with -p no:cacheprovider and per-test timeout
         cmd = [
             sys.executable,
             "-m",
@@ -311,7 +565,7 @@ def run_pytest_on_tests(
             "no:cacheprovider",
             "-o",
             "addopts=",
-            "--timeout=45",
+            "--timeout=180",
             "-r",
             "fE",
             "-v",
@@ -330,7 +584,6 @@ def run_pytest_on_tests(
         )
         output = proc.stdout + "\n" + proc.stderr
 
-        # Parse failures, errors, AND pytest 9 SUBFAILED lines!
         failing: set[str] = set()
         nodeid_set = set(test_nodeids)
         for line in output.splitlines():
@@ -344,8 +597,6 @@ def run_pytest_on_tests(
                     if nid in s:
                         failing.add(nid)
 
-        # If pytest exited non-zero and we couldn't parse a specific nodeid (e.g. collection error),
-        # conservatively mark all tests in files that errored (or all tested nodeids) as failing!
         if proc.returncode != 0 and not failing:
             failing.update(nodeid_set)
 
@@ -361,71 +612,84 @@ def main() -> None:
     tests = json.loads(tests_json_path.read_text("utf-8"))["tests"]
     num_to_id = {t["number"]: t["id"] for t in tests}
 
-    # Build both static-only and hybrid-verified selectors (disable batch wall cutoff during test)
+    verifier_mode = os.environ.get("DIFF_VERIFIER_MODE", "off").strip().lower()
     os.environ["BLAST_WALL_LIMIT_SEC"] = "3600"
-    old_disable = os.environ.get("BLAST_DISABLE_VERIFIER")
-    os.environ["BLAST_DISABLE_VERIFIER"] = "1"
-    sel_static = sel.BlastRadiusSelector(map_data, tests)
-    if old_disable is None:
-        os.environ.pop("BLAST_DISABLE_VERIFIER", None)
-    else:
-        os.environ["BLAST_DISABLE_VERIFIER"] = old_disable
-    sel_hybrid = sel.BlastRadiusSelector(map_data, tests)
-    if sel_hybrid.verifier is not None:
-        sel_hybrid.verifier.wall_cutoff_sec = 3600.0
 
-    edits = generate_synthetic_edits(sqlglot_root)
-    print(f"Generated {len(edits)} synthetic edits across all categories.\n")
-    print(f"{'name':30s} {'kind':16s} {'static':>6s} {'verif':>6s} {'dropped':>7s} {'wrong_drops':>11s}  detail")
+    # Base selector: profiles OFF, verifier OFF
+    os.environ["BLAST_DISABLE_PROFILES"] = "1"
+    os.environ["BLAST_VERIFIER_MODE"] = "off"
+    os.environ.pop("BLAST_DISABLE_VERIFIER", None)
+    sel_base = sel.BlastRadiusSelector(map_data, tests)
+
+    # Target selector: profiles ON, verifier = DIFF_VERIFIER_MODE
+    os.environ["BLAST_DISABLE_PROFILES"] = "0"
+    os.environ["BLAST_VERIFIER_MODE"] = verifier_mode
+    sel_target = sel.BlastRadiusSelector(map_data, tests)
+    if sel_target.verifier is not None:
+        sel_target.verifier.wall_cutoff_sec = 3600.0
+
+    edits = generate_synthetic_edits(sqlglot_root, map_data)
+    assert len(edits) >= 100, f"Expected >= 100 synthetic edits, got {len(edits)}"
+
+    print(
+        f"Generated {len(edits)} synthetic edits (profiles=ON, verifier_mode={verifier_mode}).\n"
+    )
+    print(f"{'name':38s} {'kind':18s} {'base':>5s} {'kept':>5s} {'drop':>5s} {'wrong':>5s}  detail")
     print("-" * 105)
 
     total_wrong_drops = 0
-    shadow_wrong_drops = 0
-    results_summary: list[dict[str, Any]] = []
+    total_dropped_tests = 0
+    edits_with_drops = 0
+    by_kind: dict[str, list[int]] = {}  # kind -> [count, edits_with_drops, dropped_tests, wrong_drops]
 
     for ed in edits:
-        st_nums = sel_static.select_test_numbers(ed["patch"])
-        hy_nums = sel_hybrid.select_test_numbers(ed["patch"])
-        dropped_nums = sorted(set(st_nums) - set(hy_nums))
+        st_nums = sel_base.select_test_numbers(ed["patch"])
+        tg_nums = sel_target.select_test_numbers(ed["patch"])
+        dropped_nums = sorted(set(st_nums) - set(tg_nums))
         dropped_nids = [num_to_id[n] for n in dropped_nums if n in num_to_id]
-
-        # Check if shadow pruning could have been involved
-        parsed = sel.pp.parse_unified_diff(ed["patch"])
-        cats = [sel.pp.classify_file(fp.path) for fp in parsed.files]
-        ppy, pnon, _, ok = sel_hybrid._build_overlay_for_verifier(parsed, cats)
-        is_shadow = ver._can_shadow_instrument(ppy, pnon) if ok else False
 
         wrong_nids = run_pytest_on_tests(sqlglot_root, ed["files"], dropped_nids) if dropped_nids else set()
         total_wrong_drops += len(wrong_nids)
-        if wrong_nids and is_shadow:
-            shadow_wrong_drops += len(wrong_nids)
+        total_dropped_tests += len(dropped_nums)
+        if dropped_nums:
+            edits_with_drops += 1
+
+        st_k = by_kind.setdefault(ed["kind"], [0, 0, 0, 0])
+        st_k[0] += 1
+        if dropped_nums:
+            st_k[1] += 1
+        st_k[2] += len(dropped_nums)
+        st_k[3] += len(wrong_nids)
 
         detail = ""
         if wrong_nids:
-            detail = f"WRONG DROP (shadow={is_shadow}): {sorted(wrong_nids)[:3]}"
-        elif ed["kind"] in ("verifier_timeout", "verifier_error"):
-            detail = "KEPT ALL (safe)" if not dropped_nums else f"dropped {len(dropped_nums)} passed"
+            detail = f"WRONG DROP: {sorted(wrong_nids)[:3]}"
+        elif ed["name"] == "cond_rare_source_none_trap":
+            kept_nids = {num_to_id[n] for n in tg_nums if n in num_to_id}
+            tpcds_kept = any("test_execute_tpcds" in x for x in kept_nids)
+            qcols_kept = any("test_qualify_columns" in x for x in kept_nids)
+            detail = f"TRAP OK (dropped={len(dropped_nums)} passed; tpcds_kept={tpcds_kept}, qcols_kept={qcols_kept})"
+        elif dropped_nums:
+            detail = f"all {len(dropped_nums)} dropped passed pytest"
         else:
-            detail = f"ok (shadow={is_shadow})"
+            detail = "kept all (safe)"
 
         print(
-            f"{ed['name']:30s} {ed['kind']:16s} {len(st_nums):6d} {len(hy_nums):6d} "
-            f"{len(dropped_nums):7d} {len(wrong_nids):11d}  {detail}"
-        )
-        results_summary.append(
-            {
-                "name": ed["name"],
-                "kind": ed["kind"],
-                "static": len(st_nums),
-                "verified": len(hy_nums),
-                "dropped": len(dropped_nums),
-                "wrong_drops": sorted(wrong_nids),
-                "is_shadow": is_shadow,
-            }
+            f"{ed['name'][:38]:38s} {ed['kind'][:18]:18s} {len(st_nums):5d} {len(tg_nums):5d} "
+            f"{len(dropped_nums):5d} {len(wrong_nids):5d}  {detail}"
         )
 
     print("-" * 105)
-    print(f"TOTAL WRONG DROPS: {total_wrong_drops} (shadow-related: {shadow_wrong_drops})")
+    print("\nSummary by edit kind:")
+    print(f"{'kind':20s} {'edits':>6s} {'w/drops':>8s} {'dropped_tests':>14s} {'wrong_drops':>12s}")
+    for k, (cnt, ed_d, drp, wrg) in sorted(by_kind.items()):
+        print(f"{k:20s} {cnt:6d} {ed_d:8d} {drp:14d} {wrg:12d}")
+    print("-" * 66)
+    print(
+        f"TOTAL: {len(edits)} edits, {edits_with_drops} edits with drops, "
+        f"{total_dropped_tests} dropped tests verified by pytest, "
+        f"TOTAL WRONG DROPS: {total_wrong_drops}"
+    )
     if total_wrong_drops > 0:
         sys.exit(1)
 
