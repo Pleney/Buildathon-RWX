@@ -207,6 +207,30 @@ Measured inside the exact scorer container (`--cpus 2 --read-only --user 65534:6
   - 1.5x batch (45 commits, default 180 s limit under `--cpus 2`): wall **`17.89 s`** (9.9% of 180 s limit), Simulated `160.917 s`, Misses **`0 / 45`**.
   - 1.5x batch (45 commits, forced `BLAST_WALL_LIMIT_SEC=5.0` -> `3.0 s` cutoff): guard fired cleanly mid-batch (`4.67 s`), wall **`6.24 s`**, Misses **`0 / 45`**.
 
+### Step 4 & Step 5: Differential Test (`diff_test.py`) & Shadow-Expression Pruning Audit
+- Built `diff_test.py`: generates 19 synthetic edits against pinned commit `eb11aec` covering all 9 categories (`constant`, `dict_value`, `condition`, `condition_rare`, `condition_equiv`, `return_value`, `decorator`, `signature`, `import`, `class_body`, `fixture`) plus verifier safety stress tests (`verifier_timeout` infinite loop, `verifier_error` syntax error). Compares every dropped test (`static_set - verified_set`) against real `pytest` (`SKIP_INTEGRATION=0`, catching `FAILED`, `ERROR`, timeouts, and pytest 9 `SUBFAILED`).
+- **Critical finding (shadow-expression pruning enabled)**:
+  - `diff_test.py` caught **2 wrong drops** on `cond_rare_source_none_trap` (`sqlglot/optimizer/qualify_columns.py`, `if source is None:` -> `if source is None and False:`): because `source` was never `None` during the first 16 cheap canary tests, shadow checking saw `0` divergences across 150+ calls and dropped all 76 tests — wrongly dropping `TestExecutor::test_execute_tpcds` and `TestOptimizer::test_qualify_columns`, both of which FAILED in real pytest (which would incur a +300 s miss penalty!).
+  - All other verifier paths (`safety_timeout_infinite_loop`, `safety_syntax_error`, and direct run-and-drop) had **0 wrong drops**.
+- **Action taken (per Step 5 requirement)**:
+  - Disabled speculative unrun-test pruning (`enable_shadow_pruning = False`, `enable_laplace_pruning = False`) in `verifier.py` so **only tests that actually execute and pass** inside the isolated forked child are ever dropped.
+  - Re-ran `diff_test.py` across all 19 synthetic edits -> **`TOTAL WRONG DROPS: 0`**.
+- **Measured savings of shadow-expression pruning & final Step 5 score (`--cpus 2 --read-only --user 65534:65534`, 3 runs)**:
+  - With shadow pruning (Step 3): Simulated `94.581 s` + Median CPU `10.211 s` = **`104.792 s`** (0 sample misses, but **2 wrong drops** on differential test).
+  - Without shadow pruning (Step 5, zero-wrong-drop verified): Simulated **`144.822 s`** + Median CPU **`9.402 s`** (runs: `9.402 s`, `9.360 s`, `9.561 s`) = **`154.224 s`** (**0 sample misses**, **0/19 differential wrong drops**).
+  - **Shadow-expression pruning was saving `50.241 s` simulated / `49.433 s` net** on the 30 samples (from the two covered `is`->`==` edits hitting `test_execute_tpcds`), at the risk of +300 s misses on rare-True branch conditions.
+  - Even with shadow pruning disabled, zero-wrong-drop Hybrid v3 (`154.224 s`) beats Pure-Static v1 (`166.102 s`) by **`-11.878 s`** on 30 samples with 0 speculative miss risk.
+
+### Branch `hybrid-v3-econ` Summary Table (30 Samples, Exact Scorer Docker Limits)
+| Step | Description | Simulated | Median CPU | Total | Sample Misses | Diff-Test Wrong Drops |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Pure-Static v1 (`90f2d8f`) | Static coverage + AST + packer | 165.365 s | 0.737 s | 166.102 s | 0 | — |
+| Step 1 (`9a38b9b` + `econ_report.py`) | Hybrid v2 baseline (shadow ON) | 94.581 s | 12.513 s | 107.094 s | 0 | 2 (shadow) |
+| Step 2 (`98588d5`) | + Economic gate & saving/CPU order (shadow ON) | 94.581 s | 10.069 s | 104.650 s | 0 | 2 (shadow) |
+| Step 3 (`e490f4d`) | + 60% wall-time deadline guard (shadow ON) | 94.581 s | 10.211 s | 104.792 s | 0 | 2 (shadow) |
+| **Step 4–5 (HEAD)** | **Shadow & Laplace unrun-pruning DISABLED** | **144.822 s** | **9.402 s** | **154.224 s** | **0** | **0 / 19** |
+
+
 
 
 

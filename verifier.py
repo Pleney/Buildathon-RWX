@@ -57,15 +57,17 @@ DEFAULT_VERIFIER_CONFIG: dict[str, Any] = {
     "max_canary_tests": 45,
     # Per-test wall alarm timeout in seconds (prevents infinite loops)
     "per_test_timeout_sec": 8,
-    # Shadow-verified equivalence thresholds:
-    # Stop running extra canaries early once shadow proof is strong (0 divergences)
+    # Speculative pruning of unrun tests (shadow-expression & Laplace) DISABLED after
+    # differential testing found wrong drops on rare-True branch conditions.
+    # Only tests that actually execute and pass in the forked child may be dropped!
+    "enable_shadow_pruning": False,
+    "enable_laplace_pruning": False,
+    # Shadow-verified equivalence thresholds (only used if enable_shadow_pruning=True)
     "shadow_early_stop_passed": 16,
     "shadow_early_stop_calls": 150,
-    # Minimum evidence for shadow-verified equivalence FR4 decision
     "shadow_min_passed": 12,
     "shadow_min_calls": 50,
-    # Non-shadow Bayesian Laplace pruning (ultra-conservative: only prunes >21s monsters
-    # when ~40+ tests covering the exact same line all pass with 0 failures)
+    # Non-shadow Bayesian Laplace pruning (only used if enable_laplace_pruning=True)
     "laplace_alpha": 3.0,
     "laplace_min_passed": 35,
     # Skip verifying fixture-only commits (almost always fail their single test)
@@ -179,7 +181,7 @@ def _economic_plan(
             seen_m.add(nid.split("::", 1)[0])
         max_saving = static_cost
         can_eliminate_all = True
-    elif can_shadow and len(runnable) >= sh_min_p:
+    elif can_shadow and bool(cfg.get("enable_shadow_pruning", False)) and len(runnable) >= sh_min_p:
         # Case B: Shadow-instrumentable canary proof can eliminate entire static_cost!
         canary_slice = runnable[: min(len(runnable), sh_stop_p)]
         seen_m = set()
@@ -189,7 +191,7 @@ def _economic_plan(
             seen_m.add(nid.split("::", 1)[0])
         max_saving = static_cost
         can_eliminate_all = True
-    elif len(runnable) >= lap_min_p:
+    elif bool(cfg.get("enable_laplace_pruning", False)) and len(runnable) >= lap_min_p:
         # Case C: Enough runnable canaries for conservative Laplace pruning of >15s monsters
         m_est = min(len(runnable), int(cfg["max_canary_tests"]))
         p_post = lap_alpha / (m_est + lap_alpha)
@@ -729,7 +731,7 @@ def _child_verify(
     # Compile patched Python modules & build MetaPathFinder
     patched_modules: dict[str, tuple[Any, str, bool, str]] = {}
     deleted_modules: set[str] = set()
-    use_shadow = len(patched_py) == 1 and not patched_nonpy
+    use_shadow = bool(cfg.get("enable_shadow_pruning", False)) and len(patched_py) == 1 and not patched_nonpy
 
     for rel, (old_b, new_b) in patched_py.items():
         mod_name, is_pkg = _rel_to_module(rel)
@@ -1042,9 +1044,10 @@ class HybridVerifier:
         if shadow_checked and shadow_divs > 0:
             return sorted(n for n, _, _ in remaining)
 
-        # 3b. Shadow-verified equivalence (0 divergences across >= min_calls calls & >= min_passed tests)
+        # 3b. Shadow-verified equivalence (disabled by default after differential test audit)
         if (
-            shadow_checked
+            bool(self.cfg.get("enable_shadow_pruning", False))
+            and shadow_checked
             and shadow_divs == 0
             and m >= int(self.cfg["shadow_min_passed"])
             and shadow_calls >= int(self.cfg["shadow_min_calls"])
@@ -1057,8 +1060,8 @@ class HybridVerifier:
             kept = [n for n, _, d in remaining if p_any_fail * 300.0 > d]
             return sorted(kept)
 
-        # 3c. Conservative non-shadow Laplace posterior (only prunes extreme slow tests after many passes)
-        if m >= int(self.cfg["laplace_min_passed"]):
+        # 3c. Conservative non-shadow Laplace posterior (disabled by default after audit)
+        if bool(self.cfg.get("enable_laplace_pruning", False)) and m >= int(self.cfg["laplace_min_passed"]):
             alpha = float(self.cfg["laplace_alpha"])
             p_post = alpha / (m + alpha)
             kept = [n for n, _, d in remaining if p_post * 300.0 > d]
