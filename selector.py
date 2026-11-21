@@ -32,8 +32,14 @@ try:
 except ImportError:
     _packer_mod = None  # type: ignore[assignment]
 
+try:
+    import verifier as _verifier_mod  # noqa: E402
+except ImportError:
+    _verifier_mod = None  # type: ignore[assignment]
+
 DATA_DIR = Path("/data")
 DEFAULT_MAP_PATH = _APP_DIR / "map.pkl.gz"
+DEFAULT_SQLGLOT_DIR = Path(os.environ.get("BLAST_SQLGLOT_DIR", "/sqlglot"))
 MISS_PENALTY_SEC = 300.0
 WORKER_COST_MS = 2_000
 MAX_WORKERS = 8
@@ -122,7 +128,19 @@ class BlastRadiusSelector:
         self.dur_ms: dict[int, int] = {t["number"]: _duration_ms(t["seconds"]) for t in tests_list}
         self.dur_sec: dict[int, float] = {t["number"]: t["seconds"] for t in tests_list}
         self.id_to_num: dict[str, int] = {t["id"]: t["number"] for t in tests_list}
+        self.num_to_id: dict[int, str] = {t["number"]: t["id"] for t in tests_list}
         self.all_test_nums: list[int] = sorted(self.valid_test_nums)
+
+        # Optional hybrid in-container verifier (active when /sqlglot is present on Linux)
+        self.verifier: Any = None
+        if (
+            _verifier_mod is not None
+            and os.environ.get("BLAST_DISABLE_VERIFIER", "0") != "1"
+            and DEFAULT_SQLGLOT_DIR.is_dir()
+        ):
+            v = _verifier_mod.HybridVerifier(DEFAULT_SQLGLOT_DIR)
+            if v.available:
+                self.verifier = v
 
         # Map internal bit indices (0..N-1) to /data/tests.json test numbers
         map_test_ids: list[str] = self.m["test_ids"]
@@ -151,7 +169,9 @@ class BlastRadiusSelector:
         self.test_file_expr_refs: dict[str, list[str]] = self.m.get("test_file_expr_refs", {})
         self.base_sources: dict[str, bytes] = self.m["base_sources"]
 
-        # Cache decompressed base sources & AST metadata on demand
+        # Cache per-commit patched bytes & AST analyses to avoid duplicate ast.parse
+        self._last_commit_py_overlay: dict[str, tuple[bytes | None, bytes | None]] = {}
+        self._last_commit_ast_identical: set[str] = set()
         self._src_cache: dict[str, bytes] = {}
         self._stmt_spans_cache: dict[str, list[tuple[int, int]]] = {}
         self._lambda_spans_cache: dict[str, list[tuple[int, int]]] = {}
@@ -344,23 +364,100 @@ class BlastRadiusSelector:
             return True
         return self._func_scope_signature(old_node) != self._func_scope_signature(new_node)
 
-    def _tests_referencing_name(self, name: str, *, skip_plumbing_ctors: bool = False) -> int:
-        cache_key = (name, skip_plumbing_ctors)
+    def _func_reads_dict_values(self, rel: str, qn: str, attr_name: str) -> bool:
+        """Return True if function `qn` in `rel` may read values from dict `attr_name`
+        (as opposed to only testing truthiness `bool(d)` / `if d:` or key membership `k in d`)."""
+        self._ensure_ast_caches(rel)
+        fnode = self._func_node_cache.get(rel, {}).get(qn)
+        if fnode is None:
+            return True
+
+        # Build parent map for this function AST
+        parent_map: dict[ast.AST, ast.AST] = {}
+        for p in ast.walk(fnode):
+            for ch in ast.iter_child_nodes(p):
+                parent_map[ch] = p
+
+        # Collect direct references to attr_name AND any simple local aliases (`x = self.attr_name`)
+        tracked_names: set[str] = {attr_name}
+        for node in ast.walk(fnode):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                val = node.value
+                if (isinstance(val, ast.Attribute) and val.attr == attr_name) or (
+                    isinstance(val, ast.Name) and val.id == attr_name
+                ):
+                    tracked_names.add(node.targets[0].id)
+
+        def _is_truthiness_or_key_check(expr: ast.AST) -> bool:
+            p = parent_map.get(expr)
+            if p is None:
+                return False
+            # Assignment into a tracked local alias is safe (we check all uses of the alias too)
+            if isinstance(p, ast.Assign) and p.value is expr:
+                if len(p.targets) == 1 and isinstance(p.targets[0], ast.Name) and p.targets[0].id in tracked_names:
+                    return True
+                return False
+            # `if expr:` / `while expr:` / `x if expr else y`
+            if isinstance(p, (ast.If, ast.While, ast.IfExp)) and p.test is expr:
+                return True
+            # `bool(expr)`
+            if isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id == "bool":
+                return True
+            # `not expr`
+            if isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not):
+                return True
+            # `a and expr` / `expr or b` — only safe if the enclosing BoolOp is itself in truthiness context!
+            if isinstance(p, ast.BoolOp):
+                return _is_truthiness_or_key_check(p)
+            # `k in expr` / `k not in expr`
+            if (
+                isinstance(p, ast.Compare)
+                and len(p.ops) == 1
+                and isinstance(p.ops[0], (ast.In, ast.NotIn))
+                and len(p.comparators) == 1
+                and p.comparators[0] is expr
+            ):
+                return True
+            return False
+
+        for node in ast.walk(fnode):
+            is_ref = (
+                (isinstance(node, ast.Attribute) and node.attr == attr_name and isinstance(node.ctx, ast.Load))
+                or (isinstance(node, ast.Name) and node.id in tracked_names and isinstance(node.ctx, ast.Load))
+            )
+            if is_ref:
+                if not _is_truthiness_or_key_check(node):
+                    return True
+        return False
+
+    def _tests_referencing_name(
+        self,
+        name: str,
+        *,
+        skip_plumbing_ctors: bool = False,
+        dict_values_only: bool = False,
+        also_lower: bool = False,
+    ) -> int:
+        cache_key = (name, skip_plumbing_ctors, dict_values_only, also_lower)
         cached = self._name_ref_tests_cache.get(cache_key)
         if cached is not None:
             return cached
+        names_to_check = (name, name.lower()) if (also_lower and name.isupper() and name.lower() != name) else (name,)
         runtime_bits = 0
         ctor_bits = 0
-        for rel, qn in self._name_to_locations.get(name, ()):
-            # Only runtime functions/methods (exclude class-body definitions which are writes)
-            fb = self.func_to_tests.get(rel, {}).get(qn, 0)
-            if not fb:
-                continue
-            short = qn.rsplit(".", 1)[-1]
-            if skip_plumbing_ctors and short in ("__init__", "__new__", "_init_core"):
-                ctor_bits |= fb
-            else:
-                runtime_bits |= fb
+        for nm in names_to_check:
+            for rel, qn in self._name_to_locations.get(nm, ()):
+                # Only runtime functions/methods (exclude class-body definitions which are writes)
+                fb = self.func_to_tests.get(rel, {}).get(qn, 0)
+                if not fb:
+                    continue
+                short = qn.rsplit(".", 1)[-1]
+                if skip_plumbing_ctors and short in ("__init__", "__new__", "_init_core"):
+                    ctor_bits |= fb
+                else:
+                    if dict_values_only and not self._func_reads_dict_values(rel, qn, nm):
+                        continue
+                    runtime_bits |= fb
         bits = runtime_bits if runtime_bits else ctor_bits
         self._name_ref_tests_cache[cache_key] = bits
         return bits
@@ -456,6 +553,10 @@ class BlastRadiusSelector:
             return
 
         ana = pp.analyze_python_change(old_bytes, new_bytes)
+        if ana.ast_identical:
+            self._last_commit_ast_identical.add(rel)
+        else:
+            self._last_commit_py_overlay[rel] = (old_bytes, new_bytes)
 
         # 1. Syntax error or encoding change -> all importers + dialect tests + meta
         if ana.syntax_error:
@@ -591,7 +692,7 @@ class BlastRadiusSelector:
 
         # 7. Class attribute / declarative table changes (e.g. FUNCTIONS, SHOW_PARSERS,
         #    NUMERIC_ESCAPES, WEEK_OFFSET, arg_types, TRANSFORMS, KEYWORDS)
-        for cq, attr_name, dkeys in ana.changed_class_attrs:
+        for cq, attr_name, dkeys, dict_values_only in ana.changed_class_attrs:
             # Only treat direct line coverage as a runtime hit when the changed line is
             # inside a lambda (avoiding accidental lazy-import first-test hits on class bodies!)
             direct_attr_lines = 0
@@ -629,10 +730,12 @@ class BlastRadiusSelector:
 
             # Dialect / Parser / Generator / Tokenizer class attribute
             dial_bits = self._subclass_dialect_tests(rel, cq)
-            ref_bits = self._tests_referencing_name(attr_name, skip_plumbing_ctors=True)
-            if attr_name.isupper():
-                # Check lowercase mirror (e.g. TokenizerCore.numeric_escapes <- NUMERIC_ESCAPES)
-                ref_bits |= self._tests_referencing_name(attr_name.lower(), skip_plumbing_ctors=True)
+            ref_bits = self._tests_referencing_name(
+                attr_name,
+                skip_plumbing_ctors=True,
+                dict_values_only=dict_values_only,
+                also_lower=True,
+            )
 
             # If dict keys are Expr class names (e.g. TRANSFORMS = {exp.Foo: ...}),
             # we can intersect even more tightly with expr_to_tests!
@@ -726,6 +829,10 @@ class BlastRadiusSelector:
             return
 
         ana = pp.analyze_python_change(old_bytes, new_bytes)
+        if ana.ast_identical:
+            self._last_commit_ast_identical.add(rel)
+        else:
+            self._last_commit_py_overlay[rel] = (old_bytes, new_bytes)
         if ana.syntax_error:
             self._add_prob(probs, all_in_file if all_in_file else self.all_map_bits, cfg["p_direct"])
             return
@@ -784,6 +891,10 @@ class BlastRadiusSelector:
             return
 
         ana = pp.analyze_python_change(old_bytes, new_bytes)
+        if ana.ast_identical:
+            self._last_commit_ast_identical.add(rel)
+        else:
+            self._last_commit_py_overlay[rel] = (old_bytes, new_bytes)
         if ana.syntax_error or ana.changed_imports or ana.changed_other_module_code or ana.added_or_removed_public_names:
             self._add_prob(probs, importers if importers else self.all_map_bits, cfg["p_direct"])
             return
@@ -815,6 +926,77 @@ class BlastRadiusSelector:
         bits = self._fixture_dir_tests.get(parent, 0) or self._all_fixture_tests or self.all_map_bits
         self._add_prob(probs, bits, cfg["p_direct"])
 
+    def _build_overlay_for_verifier(
+        self,
+        parsed: pp.ParsedPatch,
+        categories: list[str],
+    ) -> tuple[dict[str, tuple[bytes | None, bytes | None]], dict[str, bytes | None], bool, bool]:
+        """Build in-memory patched bytes for the hybrid verifier.
+        Returns `(patched_py, patched_nonpy, is_fixture_only, overlay_ok)`."""
+        patched_py: dict[str, tuple[bytes | None, bytes | None]] = {}
+        patched_nonpy: dict[str, bytes | None] = {}
+        saw_real_py = False
+        saw_fixture = False
+
+        for fp, cat in zip(parsed.files, categories):
+            if cat == "docs":
+                continue
+            if fp.is_binary or fp.is_rename or cat in ("config", "rust_or_c", "other"):
+                return {}, {}, False, False
+            rel = fp.path
+            if rel.endswith(".py") and rel.startswith(("sqlglot/", "tests/")):
+                if fp.is_deleted:
+                    patched_py[fp.base_path] = (self._get_base_source(fp.base_path), None)
+                    saw_real_py = True
+                elif fp.is_new:
+                    new_b = pp.apply_hunks(b"", fp.hunks)
+                    if new_b is None:
+                        return {}, {}, False, False
+                    patched_py[rel] = (None, new_b)
+                    saw_real_py = True
+                else:
+                    if fp.base_path in self._last_commit_ast_identical:
+                        continue
+                    cached_pair = self._last_commit_py_overlay.get(fp.base_path)
+                    if cached_pair is not None:
+                        patched_py[rel] = cached_pair
+                        saw_real_py = True
+                    else:
+                        old_b = self._get_base_source(fp.base_path)
+                        if old_b is None:
+                            return {}, {}, False, False
+                        new_b = pp.apply_hunks(old_b, fp.hunks)
+                        if new_b is None:
+                            return {}, {}, False, False
+                        ana = pp.analyze_python_change(old_b, new_b)
+                        if ana.ast_identical:
+                            continue
+                        patched_py[rel] = (old_b, new_b)
+                        saw_real_py = True
+            elif cat == "fixture":
+                saw_fixture = True
+                base_fp = DEFAULT_SQLGLOT_DIR / fp.base_path
+                if fp.is_deleted:
+                    patched_nonpy[fp.base_path] = None
+                elif fp.is_new:
+                    new_b = pp.apply_hunks(b"", fp.hunks)
+                    if new_b is None:
+                        return {}, {}, False, False
+                    patched_nonpy[rel] = new_b
+                elif base_fp.is_file():
+                    old_b = base_fp.read_bytes()
+                    new_b = pp.apply_hunks(old_b, fp.hunks)
+                    if new_b is None:
+                        return {}, {}, False, False
+                    patched_nonpy[rel] = new_b
+                else:
+                    return {}, {}, False, False
+            else:
+                return {}, {}, False, False
+
+        is_fixture_only = saw_fixture and not saw_real_py
+        return patched_py, patched_nonpy, is_fixture_only, True
+
     def select_test_numbers(self, patch_text: str) -> list[int]:
         """Return sorted list of selected test numbers from tests.json for one patch."""
         parsed = pp.parse_unified_diff(patch_text)
@@ -834,6 +1016,8 @@ class BlastRadiusSelector:
 
         probs: dict[int, float] = {}
         force_all = False
+        self._last_commit_py_overlay.clear()
+        self._last_commit_ast_identical.clear()
 
         for fp, cat in zip(parsed.files, categories):
             if cat == "docs":
@@ -883,7 +1067,24 @@ class BlastRadiusSelector:
         if selected and self.unmapped_runtime_tests:
             selected.update(self.unmapped_runtime_tests)
 
-        return sorted(selected)
+        selected_sorted = sorted(selected)
+
+        # Optional Hybrid In-Container Verification (exact run-and-drop + shadow equivalence)
+        if self.verifier is not None and selected_sorted:
+            patched_py, patched_nonpy, is_fixture_only, ok = self._build_overlay_for_verifier(
+                parsed, categories
+            )
+            if ok and (patched_py or patched_nonpy):
+                cands = [
+                    (n, self.num_to_id[n], self.dur_sec[n])
+                    for n in selected_sorted
+                    if n in self.num_to_id
+                ]
+                selected_sorted = self.verifier.verify_candidates(
+                    cands, patched_py, patched_nonpy, is_fixture_only=is_fixture_only
+                )
+
+        return selected_sorted
 
     def select_and_pack(self, commit_id: str, patch_text: str) -> dict[str, Any]:
         """Run full selection + packing with graceful degradation and strict output validation."""

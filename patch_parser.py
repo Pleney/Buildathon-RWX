@@ -445,8 +445,8 @@ class PythonChangeAnalysis:
     changed_funcs: list[str] = field(default_factory=list)
     changed_classes: list[str] = field(default_factory=list)
     changed_class_headers: list[str] = field(default_factory=list)
-    # (class_qualname, attr_name, changed_dict_keys_or_None)
-    changed_class_attrs: list[tuple[str, str, list[str] | None]] = field(default_factory=list)
+    # (class_qualname, attr_name, changed_dict_keys_or_None, dict_values_only)
+    changed_class_attrs: list[tuple[str, str, list[str] | None, bool]] = field(default_factory=list)
     # (var_name, changed_dict_keys_or_None)
     changed_module_vars: list[tuple[str, list[str] | None]] = field(default_factory=list)
     added_or_removed_public_names: list[str] = field(default_factory=list)
@@ -473,16 +473,16 @@ def _dict_key_repr(node: ast.AST | None) -> str | None:
     return _dump_node(node)
 
 
-def _diff_dict_exprs(old_val: ast.AST | None, new_val: ast.AST | None) -> list[str] | None:
+def _diff_dict_exprs(old_val: ast.AST | None, new_val: ast.AST | None) -> tuple[list[str] | None, bool]:
     """If both old and new values are ast.Dict literals with identical spreads,
-    return the list of changed/added/removed key names. Otherwise return None."""
+    return `(changed_keys, values_only_same_nonempty_keys)`. Otherwise `(None, False)`."""
     if not isinstance(old_val, ast.Dict) or not isinstance(new_val, ast.Dict):
-        return None
+        return None, False
 
     old_spreads = [_dump_node(v) for k, v in zip(old_val.keys, old_val.values) if k is None]
     new_spreads = [_dump_node(v) for k, v in zip(new_val.keys, new_val.values) if k is None]
     if old_spreads != new_spreads:
-        return None
+        return None, False
 
     old_items: dict[str, str] = {}
     for k, v in zip(old_val.keys, old_val.values):
@@ -490,7 +490,7 @@ def _diff_dict_exprs(old_val: ast.AST | None, new_val: ast.AST | None) -> list[s
             continue
         kr = _dict_key_repr(k)
         if kr is None:
-            return None
+            return None, False
         old_items[kr] = _dump_node(v)
 
     new_items: dict[str, str] = {}
@@ -499,14 +499,15 @@ def _diff_dict_exprs(old_val: ast.AST | None, new_val: ast.AST | None) -> list[s
             continue
         kr = _dict_key_repr(k)
         if kr is None:
-            return None
+            return None, False
         new_items[kr] = _dump_node(v)
 
     changed_keys: list[str] = []
     for k in set(old_items) | set(new_items):
         if old_items.get(k) != new_items.get(k):
             changed_keys.append(k)
-    return sorted(changed_keys)
+    values_only = (set(old_items.keys()) == set(new_items.keys())) and (len(old_items) > 0)
+    return sorted(changed_keys), values_only
 
 
 def _stmt_key(stmt: ast.stmt) -> tuple[str, str] | None:
@@ -580,14 +581,14 @@ def _diff_class(
             result.changed_funcs.append(fq)
             # If method added/removed or decorator/signature changed, also flag class attr
             if len(o_list) != len(n_list):
-                result.changed_class_attrs.append((qname, name, None))
+                result.changed_class_attrs.append((qname, name, None, False))
             elif len(o_list) == 1:
                 of, nf = o_list[0], n_list[0]
                 if isinstance(of, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(
                     nf, (ast.FunctionDef, ast.AsyncFunctionDef)
                 ):
                     if [_dump_node(d) for d in of.decorator_list] != [_dump_node(d) for d in nf.decorator_list]:
-                        result.changed_class_attrs.append((qname, name, None))
+                        result.changed_class_attrs.append((qname, name, None, False))
         elif kind == "class":
             if len(o_list) == 1 and len(n_list) == 1:
                 _diff_class(o_list[0], n_list[0], qname, result)  # type: ignore[arg-type]
@@ -595,9 +596,10 @@ def _diff_class(
                 result.changed_class_headers.append(f"{qname}.{name}")
         elif kind == "var":
             dkeys = None
+            val_only = False
             if len(o_list) == 1 and len(n_list) == 1:
-                dkeys = _diff_dict_exprs(_assign_value(o_list[0]), _assign_value(n_list[0]))
-            result.changed_class_attrs.append((qname, name, dkeys))
+                dkeys, val_only = _diff_dict_exprs(_assign_value(o_list[0]), _assign_value(n_list[0]))
+            result.changed_class_attrs.append((qname, name, dkeys, val_only))
         else:
             result.changed_class_headers.append(qname)
 
@@ -707,7 +709,7 @@ def analyze_python_change(old_bytes: bytes, new_bytes: bytes) -> PythonChangeAna
                 res.changed_all = True
             dkeys = None
             if len(o_list) == 1 and len(n_list) == 1:
-                dkeys = _diff_dict_exprs(_assign_value(o_list[0]), _assign_value(n_list[0]))
+                dkeys, _ = _diff_dict_exprs(_assign_value(o_list[0]), _assign_value(n_list[0]))
             res.changed_module_vars.append((name, dkeys))
 
     return res

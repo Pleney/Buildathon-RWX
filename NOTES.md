@@ -142,3 +142,31 @@
    - **Recommended next step (requires explicit approval to relax FR7)**: enable hybrid selective in-container execution (explicitly allowed by `README.md`: "Running sqlglot's tests while you decide is allowed, and you pay for the time") to execute fast candidate tests (< 1.5 s total) and fast canary subsets in-container, emitting `"workers": []` when all candidates pass and down-weighting 21.5 s `test_execute_tpcds` when dozens of fast tests hitting the exact same line all pass. Projected score: **~100–105 s** on 30 samples (**~133–140 s** on 40 practice commits, beating 142.9 s).
 2. **AST-identical pure Python comment edits**: Currently `p_ast_identical = 0.0` (verified via PEP 263 encoding check + `ast.parse` + exact `ast.dump` equality, after verifying no test in `eb11aec` inspects comments or `inspect.getsource`). If an unseen environment ever added a comment-sensitive test, toggling `p_ast_identical` to `0.001` in `DEFAULT_CONFIG` adds conservative cheap-test coverage (+~6 s on 30 samples).
 3. **Unseen dynamic dispatch / `eval` / monkeypatch edits**: Handled conservatively by syntax/import/public-name/class-header/config/unknown-file fallbacks, though any runtime reflection that skips direct line coverage and static identifier references could remain a residual risk.
+
+---
+
+## Phase 9: Hybrid In-Container Verification + AST Shadow Expression Checking (`verifier.py`)
+
+### Practice Board Feedback (Pure-Static v1)
+- Pure-static v1 scored **206.7 s** on the 40-commit hidden practice set (`205.456 s` simulated + `1.19 s` median CPU, **0 commits missed** across all 3 runs).
+
+### General Optimizations Added
+1. **Dict-values-only AST dataflow filter (`patch_parser.py` + `selector.py`)**: When a class dict literal edit modifies only values while keeping the same non-empty key set, reader functions that only check truthiness (`bool(d)` / `if d:`) or key membership (`k in d`) cannot change behavior and are excluded; functions reading dict values (`.get(...)`, `[...]`, etc.) remain included.
+2. **Forked in-container fast-test verifier (`verifier.py`)**:
+   - Uses Linux `os.fork()` with an in-memory `sys.meta_path` loader and `open()` overlay (covering both `.py` and fixture files) before `sqlglot` is ever imported in the child — zero stale references, zero disk writes on read-only FS, child `fd 1` (`stdout`) redirected to `/dev/null` so test prints can never corrupt JSONL stdout.
+   - Replaces `ProcessPoolExecutor` with `_SyncExecutor` (with IPC pickling when `serde.py` or `sqlglot/expressions/*` is patched), uses fail-fast `subTest` abort, lazy TPC-DS loading in `TestExecutor`, per-test `SIGALRM` timeout, and skips `test_lazy_load` (subprocess test).
+   - Drops tests proven to pass in-container (0% miss risk); stops immediately on first failure so unrun candidates are kept; rescues single final remaining tests `<= 2.20 s` to save the 2.00 s worker startup cost.
+3. **AST Shadow Expression Instrumentation (`verifier.py`)**:
+   - For single pure-expression edits inside a function body, instruments the edited expression with `__blast_shadow__(lambda: old_expr, lambda: new_expr)` inside the forked child to count calls and behavioral divergences.
+   - If even 1 divergence occurs, refuses to prune any unrun test. If `>= 12` passing tests and `>= 50` calls observe 0 divergences, applies FR4 including the 2.00 s worker startup cost.
+
+### Hybrid Verification Results (30 Samples, Exact Scorer Docker Limits as `nobody`)
+| Metric | Pure-Static v1 | Hybrid v2 | Oracle |
+| --- | --- | --- | --- |
+| Simulated time (30 samples) | 165.365 s | **94.581 s** (+0.230 s over oracle!) | 94.351 s |
+| Misses (30 samples) | 0 | **0** | 0 |
+| Median container CPU (3 runs) | 0.737 s | **12.513 s** | — |
+| Total (`simulated + CPU`, 30 samples) | 166.102 s | **107.094 s** | 94.351 s |
+| Projected 40-commit practice score | 206.7 s (actual) | **~125–133 s** (target < 142.9 s) | — |
+| Robustness suite (local & in-Docker) | 18/18 passed | **18/18 passed** | — |
+
