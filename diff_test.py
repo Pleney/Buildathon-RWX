@@ -28,13 +28,17 @@ Requires 0 wrong drops across all >= 100 edits.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import difflib
+import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -517,14 +521,69 @@ def generate_synthetic_edits(sqlglot_root: Path, map_data: dict[str, Any]) -> li
     return edits
 
 
+def is_holdout_edit(name: str) -> bool:
+    """Deterministic 20% hold-out split by edit name hash (never used for dev tuning)."""
+    # Keep mandatory explicit traps in dev/quick so gate.sh always tests them
+    if name in (
+        "cond_rare_source_none_trap",
+        "cond_rare_mysql_unsigned_trap",
+        "safety_timeout_infinite_loop",
+        "safety_syntax_error",
+    ):
+        return False
+    return hashlib.sha256(name.encode("utf-8")).digest()[0] < 51  # 51/256 ~= 19.9%
+
+
+def select_quick_edits(edits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Select ~30-40 representative quick-mode edits covering every category,
+    all hand-crafted adversarial traps, and any phase-specific stress edits."""
+    hand_crafted_kinds = {
+        "constant",
+        "dict_value",
+        "condition",
+        "condition_rare",
+        "condition_equiv",
+        "return_value",
+        "decorator",
+        "signature",
+        "import",
+        "class_body",
+        "fixture",
+        "verifier_timeout",
+        "verifier_error",
+        # Phase 1-4 dedicated stress kinds
+        "p1_multisite_feed",
+        "p1_nested_expr",
+        "p1_short_circuit",
+        "p1_root_init",
+        "p2_mapping_key",
+        "p3_equiv",
+        "p4_range_const_default",
+    }
+    picked: list[dict[str, Any]] = []
+    mined_per_kind: dict[str, int] = {}
+    for ed in edits:
+        k = ed["kind"]
+        if k in hand_crafted_kinds or ed.get("quick"):
+            picked.append(ed)
+        else:
+            cnt = mined_per_kind.get(k, 0)
+            # Pick first 2 non-holdout edits per mined family for quick gate
+            if cnt < 2 and not is_holdout_edit(ed["name"]):
+                picked.append(ed)
+                mined_per_kind[k] = cnt + 1
+    return picked
+
+
 def run_pytest_on_tests(
     sqlglot_root: Path,
     file_overrides: dict[str, str],
     test_nodeids: list[str],
+    hard_timeout_sec: float = 300.0,
 ) -> set[str]:
     """Apply `file_overrides` to an isolated /tmp copy of sqlglot_root and run real
     pytest (SKIP_INTEGRATION=0, catching FAILED, ERROR, timeouts, and pytest 9 SUBFAILED)
-    on `test_nodeids`. Returns the set of failing nodeids."""
+    on `test_nodeids`. Uses process-group kill on timeout. Returns failing nodeids."""
     if not test_nodeids:
         return set()
 
@@ -557,53 +616,80 @@ def run_pytest_on_tests(
         env["SKIP_INTEGRATION"] = "0"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
 
-        cmd = [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-p",
-            "no:cacheprovider",
-            "-o",
-            "addopts=",
-            "--timeout=180",
-            "-r",
-            "fE",
-            "-v",
-            *test_nodeids,
-        ]
-        if len(test_nodeids) >= 8:
-            cmd.insert(3, "-n")
-            cmd.insert(4, "2")
-
-        proc = subprocess.run(
-            cmd,
-            cwd=str(tmp),
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        output = proc.stdout + "\n" + proc.stderr
-
+        # Chunk large test sets (>350 tests) to avoid argv/memory issues
         failing: set[str] = set()
-        nodeid_set = set(test_nodeids)
-        for line in output.splitlines():
-            s = line.strip()
-            if s.startswith(("FAILED ", "ERROR ", "SUBFAILED")):
-                for nid in nodeid_set:
-                    if nid in s:
-                        failing.add(nid)
-            elif " FAILED" in s or " ERROR" in s or " SUBFAILED" in s:
-                for nid in nodeid_set:
-                    if nid in s:
-                        failing.add(nid)
+        t_deadline = time.monotonic() + hard_timeout_sec
+        for start in range(0, len(test_nodeids), 350):
+            chunk = test_nodeids[start : start + 350]
+            rem = t_deadline - time.monotonic()
+            if rem <= 2.0:
+                failing.update(chunk)
+                continue
+            cmd = [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:cacheprovider",
+                "-o",
+                "addopts=",
+                "--timeout=180",
+                "-r",
+                "fE",
+                "-v",
+                *chunk,
+            ]
+            if len(chunk) >= 12 and not any("test_execute_tpcds" in n for n in chunk):
+                cmd.insert(3, "-n")
+                cmd.insert(4, "2")
 
-        if proc.returncode != 0 and not failing:
-            failing.update(nodeid_set)
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(tmp),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                stdout, stderr = proc.communicate(timeout=rem)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+                failing.update(chunk)
+                continue
+
+            output = (stdout or "") + "\n" + (stderr or "")
+            chunk_set = set(chunk)
+            chunk_fail: set[str] = set()
+            for line in output.splitlines():
+                s = line.strip()
+                if s.startswith(("FAILED ", "ERROR ", "SUBFAILED")) or (
+                    " FAILED" in s or " ERROR" in s or " SUBFAILED" in s
+                ):
+                    for nid in chunk_set:
+                        if nid in s:
+                            chunk_fail.add(nid)
+            if proc.returncode != 0 and not chunk_fail:
+                chunk_fail.update(chunk_set)
+            failing.update(chunk_fail)
 
         return failing
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Differential test vs real pytest.")
+    parser.add_argument("--quick", action="store_true", help="Run representative ~30-edit quick suite")
+    parser.add_argument("--split", choices=("all", "dev", "holdout"), default="all")
+    args = parser.parse_args()
+
     sqlglot_root = Path("/sqlglot")
     map_path = Path("/app/map.pkl.gz")
     tests_json_path = Path("/data/tests.json")
@@ -615,32 +701,69 @@ def main() -> None:
     verifier_mode = os.environ.get("DIFF_VERIFIER_MODE", "off").strip().lower()
     os.environ["BLAST_WALL_LIMIT_SEC"] = "3600"
 
-    # Base selector: profiles OFF, verifier OFF
+    # Base selector: conservative pure-static baseline (ALL pruning phases OFF)
+    saved_env = {
+        k: os.environ.get(k)
+        for k in (
+            "BLAST_DISABLE_PROFILES",
+            "BLAST_VERIFIER_MODE",
+            "BLAST_DISABLE_VERIFIER",
+            "BLAST_P1_REACH",
+            "BLAST_P1_MULTISITE",
+            "BLAST_P1_ROOT_INIT",
+            "BLAST_P2_MAPPINGS",
+            "BLAST_P3_EQUIV",
+            "BLAST_P4_RANGES",
+        )
+    }
     os.environ["BLAST_DISABLE_PROFILES"] = "1"
     os.environ["BLAST_VERIFIER_MODE"] = "off"
+    os.environ["BLAST_P1_REACH"] = "0"
+    os.environ["BLAST_P1_MULTISITE"] = "0"
+    os.environ["BLAST_P1_ROOT_INIT"] = "0"
+    os.environ["BLAST_P2_MAPPINGS"] = "0"
+    os.environ["BLAST_P3_EQUIV"] = "0"
+    os.environ["BLAST_P4_RANGES"] = "0"
     os.environ.pop("BLAST_DISABLE_VERIFIER", None)
     sel_base = sel.BlastRadiusSelector(map_data, tests)
 
-    # Target selector: profiles ON, verifier = DIFF_VERIFIER_MODE
+    # Restore target env (default: all implemented phases ON, verifier = DIFF_VERIFIER_MODE)
+    for k, v in saved_env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
     os.environ["BLAST_DISABLE_PROFILES"] = "0"
     os.environ["BLAST_VERIFIER_MODE"] = verifier_mode
     sel_target = sel.BlastRadiusSelector(map_data, tests)
     if sel_target.verifier is not None:
         sel_target.verifier.wall_cutoff_sec = 3600.0
 
-    edits = generate_synthetic_edits(sqlglot_root, map_data)
-    assert len(edits) >= 100, f"Expected >= 100 synthetic edits, got {len(edits)}"
+    all_edits = generate_synthetic_edits(sqlglot_root, map_data)
+    assert len(all_edits) >= 100, f"Expected >= 100 synthetic edits, got {len(all_edits)}"
 
+    if args.quick:
+        edits = select_quick_edits(all_edits)
+    elif args.split == "holdout":
+        edits = [e for e in all_edits if is_holdout_edit(e["name"])]
+    elif args.split == "dev":
+        edits = [e for e in all_edits if not is_holdout_edit(e["name"])]
+    else:
+        edits = all_edits
+
+    t0 = time.monotonic()
     print(
-        f"Generated {len(edits)} synthetic edits (profiles=ON, verifier_mode={verifier_mode}).\n"
+        f"Running {len(edits)} synthetic edits (mode={'quick' if args.quick else args.split}, "
+        f"profiles=ON, verifier_mode={verifier_mode}).\n",
+        flush=True,
     )
-    print(f"{'name':38s} {'kind':18s} {'base':>5s} {'kept':>5s} {'drop':>5s} {'wrong':>5s}  detail")
-    print("-" * 105)
+    print(f"{'name':38s} {'kind':18s} {'base':>5s} {'kept':>5s} {'drop':>5s} {'wrong':>5s}  detail", flush=True)
+    print("-" * 105, flush=True)
 
     total_wrong_drops = 0
     total_dropped_tests = 0
     edits_with_drops = 0
-    by_kind: dict[str, list[int]] = {}  # kind -> [count, edits_with_drops, dropped_tests, wrong_drops]
+    by_kind: dict[str, list[int]] = {}
 
     for ed in edits:
         st_nums = sel_base.select_test_numbers(ed["patch"])
@@ -676,19 +799,21 @@ def main() -> None:
 
         print(
             f"{ed['name'][:38]:38s} {ed['kind'][:18]:18s} {len(st_nums):5d} {len(tg_nums):5d} "
-            f"{len(dropped_nums):5d} {len(wrong_nids):5d}  {detail}"
+            f"{len(dropped_nums):5d} {len(wrong_nids):5d}  {detail}",
+            flush=True,
         )
 
-    print("-" * 105)
-    print("\nSummary by edit kind:")
-    print(f"{'kind':20s} {'edits':>6s} {'w/drops':>8s} {'dropped_tests':>14s} {'wrong_drops':>12s}")
+    print("-" * 105, flush=True)
+    print("\nSummary by edit kind:", flush=True)
+    print(f"{'kind':22s} {'edits':>6s} {'w/drops':>8s} {'dropped_tests':>14s} {'wrong_drops':>12s}", flush=True)
     for k, (cnt, ed_d, drp, wrg) in sorted(by_kind.items()):
-        print(f"{k:20s} {cnt:6d} {ed_d:8d} {drp:14d} {wrg:12d}")
-    print("-" * 66)
+        print(f"{k:22s} {cnt:6d} {ed_d:8d} {drp:14d} {wrg:12d}", flush=True)
+    print("-" * 68, flush=True)
     print(
-        f"TOTAL: {len(edits)} edits, {edits_with_drops} edits with drops, "
+        f"TOTAL ({time.monotonic() - t0:.1f}s): {len(edits)} edits, {edits_with_drops} edits with drops, "
         f"{total_dropped_tests} dropped tests verified by pytest, "
-        f"TOTAL WRONG DROPS: {total_wrong_drops}"
+        f"TOTAL WRONG DROPS: {total_wrong_drops}",
+        flush=True,
     )
     if total_wrong_drops > 0:
         sys.exit(1)

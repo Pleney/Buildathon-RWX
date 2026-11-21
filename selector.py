@@ -41,6 +41,7 @@ _verifier_mod: Any = None
 
 DATA_DIR = Path("/data")
 DEFAULT_MAP_PATH = _APP_DIR / "map.pkl.gz"
+DEFAULT_PROFILES_PATH = _APP_DIR / "profiles.pkl.gz"
 DEFAULT_SQLGLOT_DIR = Path(os.environ.get("BLAST_SQLGLOT_DIR", "/sqlglot"))
 MISS_PENALTY_SEC = 300.0
 WORKER_COST_MS = 2_000
@@ -133,11 +134,17 @@ class BlastRadiusSelector:
         self.num_to_id: dict[int, str] = {t["number"]: t["id"] for t in tests_list}
         self.all_test_nums: list[int] = sorted(self.valid_test_nums)
 
-        # Build-time per-test expression-site profile pruning (default ON when map includes profiles)
+        # Build-time per-test profile toggles (every phase independently toggleable for ablation)
         self.use_expr_profiles: bool = (
             _expr_profiler_mod is not None
             and os.environ.get("BLAST_DISABLE_PROFILES", "0") != "1"
         )
+        self.enable_p1_reach: bool = os.environ.get("BLAST_P1_REACH", "1") != "0"
+        self.enable_p1_multisite: bool = os.environ.get("BLAST_P1_MULTISITE", "1") != "0"
+        self.enable_p1_root_init: bool = os.environ.get("BLAST_P1_ROOT_INIT", "1") != "0"
+        self.enable_p2_mappings: bool = os.environ.get("BLAST_P2_MAPPINGS", "1") != "0"
+        self.enable_p3_equiv: bool = os.environ.get("BLAST_P3_EQUIV", "1") != "0"
+        self.enable_p4_ranges: bool = os.environ.get("BLAST_P4_RANGES", "1") != "0"
 
         # Optional hybrid in-container verifier mode:
         #   "off"          - no test execution (lowest CPU)
@@ -1191,8 +1198,45 @@ class BlastRadiusSelector:
         return {"commit": commit_id, "workers": clean_workers}
 
 
-def load_map(map_path: Path = DEFAULT_MAP_PATH) -> dict[str, Any]:
-    return pickle.loads(zlib.decompress(map_path.read_bytes()))
+def load_map(
+    map_path: Path = DEFAULT_MAP_PATH,
+    profiles_path: Path | None = None,
+) -> dict[str, Any]:
+    data = pickle.loads(zlib.decompress(map_path.read_bytes()))
+    if profiles_path is None:
+        env_p = os.environ.get("BLAST_PROFILES_PATH")
+        if env_p:
+            profiles_path = Path(env_p)
+        else:
+            cand = map_path.parent / "profiles.pkl.gz"
+            if cand.is_file():
+                profiles_path = cand
+    if profiles_path is not None and profiles_path.is_file():
+        prof_data = pickle.loads(zlib.decompress(profiles_path.read_bytes()))
+        # Verify profile commit matches map commit (conservative: ignore on mismatch)
+        if prof_data.get("commit") == data.get("commit") and prof_data.get("test_ids") == data.get("test_ids"):
+            for k in (
+                "expr_profiles",
+                "reach_profiles",
+                "mapping_profiles",
+                "range_profiles",
+                "const_profiles",
+                "default_arg_profiles",
+            ):
+                if k in prof_data:
+                    data[k] = prof_data[k]
+        elif "expr_profiles" in prof_data and "test_ids" not in prof_data and prof_data.get("commit") == data.get("commit"):
+            for k in (
+                "expr_profiles",
+                "reach_profiles",
+                "mapping_profiles",
+                "range_profiles",
+                "const_profiles",
+                "default_arg_profiles",
+            ):
+                if k in prof_data:
+                    data[k] = prof_data[k]
+    return data
 
 
 def run_batch(

@@ -9,7 +9,16 @@ __pycache__/
 .coverage
 .coverage.*
 
-# Temporary local build / scratch dirs
+# Temporary local build / scratch dirs, caches, logs, JSON reports
 build_tmp/
 sqlglot_src/
+gate_tmp/
+cache/
+reports/
 *.tmp
+*.log
+*.jsonl
+*_gt.json
+*_report.json
+*_cache.json
+skipped_edits.json
