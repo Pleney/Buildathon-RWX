@@ -626,6 +626,88 @@ def generate_synthetic_edits(sqlglot_root: Path, map_data: dict[str, Any]) -> li
         "if not result or result[0] is not None:",
     )
 
+    # --- Phase 2 Quick-Set Stress Cases (per-test mapping-key lookup profiles) ---
+    # 15a. Category B value edit on NUMERIC_ESCAPES
+    add(
+        "p2_numeric_escapes_val",
+        "p2_mapping_key",
+        "sqlglot/dialects/duckdb.py",
+        'NUMERIC_ESCAPES = {"x": (16, 1, 2, 0xFF), "0": (8, 1, 3, 0o777)}',
+        'NUMERIC_ESCAPES = {"x": (16, 1, 2, 0xFF), "0": (8, 2, 3, 0o777)}',
+    )
+
+    # 15b. Category B pure closure-factory value edit on trie-backed SHOW_PARSERS
+    add(
+        "p2_show_parsers_val",
+        "p2_mapping_key",
+        "sqlglot/parsers/mysql.py",
+        '"OPEN TABLES": _show_parser("OPEN TABLES"),',
+        '"OPEN TABLES": _show_parser("OPEN TABLES", target=True),',
+    )
+
+    # 15c. Category B key addition on trie-backed SHOW_PARSERS (MUST refuse to drop!)
+    add(
+        "p2_show_parsers_add_key_trap",
+        "p2_mapping_key",
+        "sqlglot/parsers/duckdb.py",
+        '"ALL TABLES": _show_parser("ALL TABLES"),',
+        '"ALL TABLES": _show_parser("ALL TABLES"),\n        "ZZZ_FAKE": _show_parser("ZZZ_FAKE"),',
+    )
+
+    # 15d. Category A looked-up key edit in PostgresParser.FUNCTIONS (MUST KEEP failing tests!)
+    add(
+        "p2_functions_looked_up_trap",
+        "p2_mapping_key",
+        "sqlglot/parsers/postgres.py",
+        '"SHA256": lambda args: exp.SHA2Digest(\n            this=seq_get(args, 0), length=exp.Literal.number(256)\n        ),',
+        '"SHA256": lambda args: exp.SHA2Digest(\n            this=seq_get(args, 0), length=exp.Literal.number(512)\n        ),',
+    )
+
+    # 15e. Category A unseen key addition in PostgresParser.FUNCTIONS (safe drop for non-callers!)
+    add(
+        "p2_functions_add_key_safe",
+        "p2_mapping_key",
+        "sqlglot/parsers/postgres.py",
+        '"UUID": lambda args: exp.cast(args[0], exp.DType.UUID) if args else exp.Uuid(),',
+        '"UUID": lambda args: exp.cast(args[0], exp.DType.UUID) if args else exp.Uuid(),\n        "ZZZ_UNSEEN_FUNC_XYZ": lambda args: exp.Anonymous(this="ZZZ"),',
+    )
+
+    # 15f. Parent dict edit affecting subclass tests (MySQLParser.FUNCTIONS -> Doris/StarRocks/SingleStore)
+    add(
+        "p2_parent_dict_subclass_trap",
+        "p2_mapping_key",
+        "sqlglot/parsers/mysql.py",
+        '"YEAR": lambda args: exp.Year(this=exp.TsOrDsToDate(this=seq_get(args, 0))),',
+        '"YEAR": lambda args: exp.Month(this=exp.TsOrDsToDate(this=seq_get(args, 0))),',
+    )
+
+    # 15g. Non-pure import-time crash value in class dict (MUST refuse to drop!)
+    add(
+        "p2_import_time_crash_trap",
+        "p2_mapping_key",
+        "sqlglot/parsers/duckdb.py",
+        '"ALL TABLES": _show_parser("ALL TABLES"),',
+        '"ALL TABLES": 1 / 0,',
+    )
+
+    # 15h. Import-time cross-key subscript trap (TeradataParser reads Parser.FUNCTION_PARSERS['TRY_CAST'])
+    add(
+        "p2_teradata_import_subscript_trap",
+        "p2_mapping_key",
+        "sqlglot/parser.py",
+        '"TRY_CAST": lambda self: self._parse_cast(False, safe=True),',
+        '"TRY_CAST": lambda self: self._parse_cast(True, safe=False),',
+    )
+
+    # 15i. Category C TIME_MAPPING edit with Presto shared alias & INVERSE_TIME_MAPPING
+    add(
+        "p2_mysql_time_mapping_alias",
+        "p2_mapping_key",
+        "sqlglot/dialects/mysql.py",
+        '"%x": "%G",',
+        '"%x": "%Y",',
+    )
+
     return edits
 
 

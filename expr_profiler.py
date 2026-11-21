@@ -519,12 +519,16 @@ class _ProfilingLoader(importlib.abc.Loader):
         is_pkg: bool,
         recorder: BuildTimeProfileRecorder,
         enable_reach: bool = True,
+        mapping_recorder: Any = None,
+        post_exec_hook: Any = None,
     ) -> None:
         self.filepath = filepath
         self.rel = rel
         self.is_pkg = is_pkg
         self.recorder = recorder
         self.enable_reach = enable_reach
+        self.mapping_recorder = mapping_recorder
+        self.post_exec_hook = post_exec_hook
 
     def create_module(self, spec: Any) -> Any:
         return None
@@ -544,16 +548,34 @@ class _ProfilingLoader(importlib.abc.Loader):
             module.__dict__["__blast_cp__"] = self.recorder.compare_probe
             module.__dict__["__blast_rm__"] = self.recorder.reach_mark
         code = compile(tree, self.filepath, "exec")
-        exec(code, module.__dict__)
+        mr = self.mapping_recorder
+        if mr is not None:
+            mr.in_import += 1
+        try:
+            exec(code, module.__dict__)
+        finally:
+            if mr is not None:
+                mr.in_import -= 1
+        if self.post_exec_hook is not None:
+            self.post_exec_hook(module, self.rel)
 
 
 class ProfilingMetaPathFinder(importlib.abc.MetaPathFinder):
     """Intercepts sqlglot.* imports during build to inject expression & reachability probes."""
 
-    def __init__(self, sqlglot_dir: Path, recorder: BuildTimeProfileRecorder, enable_reach: bool = True) -> None:
+    def __init__(
+        self,
+        sqlglot_dir: Path,
+        recorder: BuildTimeProfileRecorder,
+        enable_reach: bool = True,
+        mapping_recorder: Any = None,
+        post_exec_hook: Any = None,
+    ) -> None:
         self.root = sqlglot_dir.resolve()
         self.recorder = recorder
         self.enable_reach = enable_reach
+        self.mapping_recorder = mapping_recorder
+        self.post_exec_hook = post_exec_hook
 
     def find_spec(self, fullname: str, path: Any, target: Any = None) -> Any:
         if fullname != "sqlglot" and not fullname.startswith("sqlglot."):
@@ -562,12 +584,28 @@ class ProfilingMetaPathFinder(importlib.abc.MetaPathFinder):
         pkg_init = self.root / rel_base / "__init__.py"
         if pkg_init.is_file():
             rel = f"{rel_base}/__init__.py"
-            loader = _ProfilingLoader(str(pkg_init), rel, True, self.recorder, self.enable_reach)
+            loader = _ProfilingLoader(
+                str(pkg_init),
+                rel,
+                True,
+                self.recorder,
+                self.enable_reach,
+                self.mapping_recorder,
+                self.post_exec_hook,
+            )
             return importlib.machinery.ModuleSpec(fullname, loader, origin=str(pkg_init), is_package=True)
         mod_file = self.root / f"{rel_base}.py"
         if mod_file.is_file():
             rel = f"{rel_base}.py"
-            loader = _ProfilingLoader(str(mod_file), rel, False, self.recorder, self.enable_reach)
+            loader = _ProfilingLoader(
+                str(mod_file),
+                rel,
+                False,
+                self.recorder,
+                self.enable_reach,
+                self.mapping_recorder,
+                self.post_exec_hook,
+            )
             return importlib.machinery.ModuleSpec(fullname, loader, origin=str(mod_file), is_package=False)
         return None
 
