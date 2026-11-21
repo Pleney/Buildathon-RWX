@@ -199,5 +199,14 @@ Measured inside the exact scorer container (`--cpus 2 --read-only --user 65534:6
   - **Total (`simulated + CPU`)**: **`104.650 s`** (**`-2.444 s`** vs `107.094 s` baseline -> **KEPT**)
   - Money-losing CPU dropped from `3.519 s` to `2.103 s` (`-40%`).
 
+### Step 3: Batch Wall-Time Deadline Guard (`verifier.py`)
+- Tracks monotonic elapsed wall time across the batch (`wall_limit_sec = 180.0`, `wall_cutoff_frac = 0.60` -> `108.0 s` cutoff, overridable via `BLAST_WALL_LIMIT_SEC` / `BLAST_WALL_CUTOFF_FRAC`).
+- Past 60% of the limit, stops forking the verifier and emits the 100%-recall static selection for all remaining commits.
+- **Scorer-limit Docker benchmark (`--cpus 2 --read-only --user 65534:65534`, 3 runs)**:
+  - 30-sample: Simulated **`94.581 s`**, Misses **`0 / 30`**, Median CPU **`10.211 s`** (runs: `10.271 s`, `10.211 s`, `10.167 s`), Total **`104.792 s`** (**KEPT**, zero overhead vs Step 2).
+  - 1.5x batch (45 commits, default 180 s limit under `--cpus 2`): wall **`17.89 s`** (9.9% of 180 s limit), Simulated `160.917 s`, Misses **`0 / 45`**.
+  - 1.5x batch (45 commits, forced `BLAST_WALL_LIMIT_SEC=5.0` -> `3.0 s` cutoff): guard fired cleanly mid-batch (`4.67 s`), wall **`6.24 s`**, Misses **`0 / 45`**.
+
+
 
 

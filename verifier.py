@@ -29,6 +29,7 @@ import pickle
 import resource
 import signal
 import sys
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,10 @@ DEFAULT_VERIFIER_CONFIG: dict[str, Any] = {
     "laplace_min_passed": 35,
     # Skip verifying fixture-only commits (almost always fail their single test)
     "skip_fixture_only": True,
+    # Batch wall-time deadline guard: stop verifying past 60% of the batch limit
+    # (practice limit = 180s -> 108s cutoff; final limit = 270s -> safely within both)
+    "wall_limit_sec": float(os.environ.get("BLAST_WALL_LIMIT_SEC", "180.0")),
+    "wall_cutoff_frac": float(os.environ.get("BLAST_WALL_CUTOFF_FRAC", "0.60")),
 }
 
 
@@ -897,6 +902,24 @@ class HybridVerifier:
             self.cfg.update(config)
         self.available = os.path.isdir(os.path.join(self.sqlglot_root, "sqlglot")) and hasattr(os, "fork")
         self._preloaded_heavy = False
+        self.batch_start_wall = time.monotonic()
+        self.wall_cutoff_sec = float(self.cfg["wall_limit_sec"]) * float(self.cfg["wall_cutoff_frac"])
+        self._deadline_tripped = False
+
+    def _past_deadline(self) -> bool:
+        if self._deadline_tripped:
+            return True
+        elapsed = time.monotonic() - self.batch_start_wall
+        if elapsed >= self.wall_cutoff_sec:
+            self._deadline_tripped = True
+            print(
+                f"[verifier] deadline guard triggered at {elapsed:.2f}s "
+                f"(cutoff {self.wall_cutoff_sec:.2f}s = {self.cfg['wall_cutoff_frac']*100:.0f}% "
+                f"of {self.cfg['wall_limit_sec']:.0f}s); emitting static selection for remaining commits",
+                file=sys.stderr,
+            )
+            return True
+        return False
 
     def _ensure_heavy_deps_preloaded(self, test_nodeids: list[str]) -> None:
         """Lazily pre-import duckdb/pandas/numpy ONCE in the parent process before fork()
@@ -925,6 +948,8 @@ class HybridVerifier:
         """Verify candidate tests in a forked child and return the pruned test numbers."""
         orig_nums = [n for n, _, _ in candidates]
         if not self.available or not candidates:
+            return orig_nums
+        if self._past_deadline():
             return orig_nums
         if is_fixture_only and self.cfg["skip_fixture_only"]:
             return orig_nums
