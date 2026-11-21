@@ -22,12 +22,110 @@ from __future__ import annotations
 
 import ast
 import enum
+import functools
 import importlib.abc
 import importlib.machinery
 import os
 import sys
 from pathlib import Path
 from typing import Any
+
+# Phase 4 bounds (conservative outward clamping & overflow caps keep profiles.pkl.gz compact)
+_RANGE_CLAMP = 16
+_NEG_INF = -(10**9)
+_POS_INF = 10**9
+_MAX_CONST_VALS_PER_TEST = 8
+MAX_CONST_VALS_PER_SITE = 32
+_MISSING_RG = object()
+
+
+def _canonicalize_const_ast(node: ast.AST) -> tuple[Any, ...] | None:
+    """Parse an AST constant literal or TokenType/DType enum member into a canonical
+    typed tuple matching runtime const_eq profiling. Returns None otherwise."""
+    if isinstance(node, ast.Constant):
+        v = node.value
+        t = type(v)
+        if t is str:
+            return ("s", v)
+        if t is int:
+            return ("i", v)
+        if t is bool:
+            return ("b", v)
+        return None
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        if isinstance(node.operand, ast.Constant) and type(node.operand.value) is int:
+            return ("i", -node.operand.value)
+        return None
+    if isinstance(node, ast.Attribute):
+        if isinstance(node.value, ast.Name) and node.value.id == "TokenType":
+            return ("e", "TokenType", node.attr)
+        if isinstance(node.value, ast.Attribute) and node.value.attr == "TokenType":
+            return ("e", "TokenType", node.attr)
+        if isinstance(node.value, ast.Name) and node.value.id == "DType":
+            return ("e", "DType", node.attr)
+        if isinstance(node.value, ast.Attribute):
+            if node.value.attr == "DType" and isinstance(node.value.value, ast.Name) and node.value.value.id == "exp":
+                return ("e", "DType", node.attr)
+            if (
+                node.value.attr == "Type"
+                and isinstance(node.value.value, ast.Attribute)
+                and node.value.value.attr == "DataType"
+            ):
+                return ("e", "DType", node.attr)
+    return None
+
+
+def _canonicalize_other_for_const(other: Any, const_v: Any) -> tuple[Any, ...] | None:
+    """Canonicalize runtime `other` operand strictly for Python equality safety
+    against `const_v`'s family. Returns None if `other` could have custom __eq__
+    or cross-type numeric/IntEnum equality coercion (caller marks unsafe)."""
+    tc = type(const_v)
+    to = type(other)
+    if tc is str:
+        if other is None:
+            return ("n",)
+        if to is str:
+            return ("s", other)
+        if to in (int, bool, float, bytes) or isinstance(other, enum.Enum):
+            return ("o",)
+        return None
+    if tc is int:
+        if other is None:
+            return ("n",)
+        if to is int:
+            return ("i", other)
+        if to in (str, bytes):
+            return ("o",)
+        # bool / float / IntEnum can equal int -> conservatively mark unsafe!
+        return None
+    if tc is bool:
+        if other is None:
+            return ("n",)
+        if to is bool:
+            return ("b", other)
+        if to in (str, bytes):
+            return ("o",)
+        return None
+    if isinstance(const_v, enum.Enum):
+        en = tc.__name__
+        if en == "TokenType":
+            if other is None:
+                return ("n",)
+            if to is tc:
+                return ("e", "TokenType", other.name)
+            if to in (str, bytes):
+                return ("o",)
+            # TokenType is IntEnum -> int/bool/float can equal TokenType -> unsafe!
+            return None
+        if en == "DType":
+            if other is None:
+                return ("n",)
+            if to is tc:
+                return ("e", "DType", other.name)
+            if to in (str, int, bool, float, bytes):
+                return ("o",)
+            return None
+    return None
 
 # Per-test per-site bit flags recorded at build time
 BIT_FALSE = 1
@@ -140,6 +238,29 @@ class BuildTimeProfileRecorder:
         self.reach_records: dict[Any, set[int]] = {}
         self.inactive_rsids: set[int] = set()
 
+        # Phase 4a: Ordered-comparison integer delta ranges (indexed by sid)
+        self.site_is_order: bytearray = bytearray()
+        self.cur_range_min: dict[int, int] = {}
+        self.cur_range_max: dict[int, int] = {}
+        self.cur_range_unsafe: set[int] = set()
+        self.range_records: dict[Any, dict[int, tuple[int, int] | None]] = {}
+
+        # Phase 4b: Constant-equality observed value sets (indexed by sid)
+        self.site_const_side: list[int] = []  # -1=none, 0=lhs const, 1=rhs const
+        self.cur_const_vals: dict[int, set[tuple[Any, ...]]] = {}
+        self.cur_const_unsafe: set[int] = set()
+        self.const_records: dict[Any, dict[int, set[tuple[Any, ...]] | None]] = {}
+
+        # Phase 4c: Default-argument usage per undecorated function/method (indexed by fid)
+        # fid -> (rel, fq, pos_slots: tuple[(idx, name, is_posonly), ...], kw_slots: tuple[name, ...])
+        self.default_funcs: list[tuple[str, str, tuple[tuple[int, str, bool], ...], tuple[str, ...]]] = []
+        self._default_func_keys: dict[tuple[str, str], int] = {}
+        self.duplicate_default_fids: set[int] = set()
+        self.cur_default_masks: list[int] = []
+        self.touched_fids: list[int] = []
+        self.default_records: dict[Any, dict[int, int]] = {}
+        self.import_default_masks: list[int] = []
+
         self.active: bool = False
         self.in_probe: bool = False
         self.cur_key: Any = None
@@ -150,12 +271,94 @@ class BuildTimeProfileRecorder:
         self._clean_eq_cache: dict[type, bool] = {}
 
     def register_site(
-        self, rel: str, lineno: int, col: int, end_lineno: int, end_col: int, is_compare: bool
+        self,
+        rel: str,
+        lineno: int,
+        col: int,
+        end_lineno: int,
+        end_col: int,
+        is_compare: bool,
+        *,
+        is_order: bool = False,
+        const_side: int = -1,
     ) -> int:
         sid = len(self.sites)
         self.sites.append((rel, lineno, col, end_lineno, end_col, is_compare))
         self.cur_flags.append(0)
+        self.site_is_order.append(1 if is_order else 0)
+        self.site_const_side.append(const_side)
         return sid
+
+    def register_default_func(
+        self,
+        rel: str,
+        fq: str,
+        pos_slots: tuple[tuple[int, str, bool], ...],
+        kw_slots: tuple[str, ...],
+    ) -> int:
+        fid = len(self.default_funcs)
+        key = (rel, fq)
+        if key in self._default_func_keys:
+            self.duplicate_default_fids.add(self._default_func_keys[key])
+            self.duplicate_default_fids.add(fid)
+        else:
+            self._default_func_keys[key] = fid
+        self.default_funcs.append((rel, fq, pos_slots, kw_slots))
+        self.cur_default_masks.append(0)
+        self.import_default_masks.append(0)
+        return fid
+
+    def wrap_default_func(self, fid: int) -> Any:
+        """Decorator recording which default arguments are omitted per test."""
+        _rel, _fq, pos_slots, kw_slots = self.default_funcs[fid]
+        n_slots = len(pos_slots) + len(kw_slots)
+        full_mask = (1 << n_slots) - 1
+        rec = self
+
+        def _dec(orig: Any) -> Any:
+            @functools.wraps(orig)
+            def _wrapped(*args: Any, **kwargs: Any) -> Any:
+                if not rec.in_probe:
+                    if not rec.active:
+                        cur_imp = rec.import_default_masks[fid]
+                        if cur_imp != full_mask:
+                            add = 0
+                            nargs = len(args)
+                            bit = 1
+                            for idx, pname, is_posonly in pos_slots:
+                                if nargs <= idx and (is_posonly or pname not in kwargs):
+                                    add |= bit
+                                bit <<= 1
+                            for pname in kw_slots:
+                                if pname not in kwargs:
+                                    add |= bit
+                                bit <<= 1
+                            if add:
+                                rec.import_default_masks[fid] = cur_imp | add
+                    else:
+                        cur = rec.cur_default_masks[fid]
+                        if cur != full_mask:
+                            add = 0
+                            nargs = len(args)
+                            bit = 1
+                            for idx, pname, is_posonly in pos_slots:
+                                if nargs <= idx and (is_posonly or pname not in kwargs):
+                                    add |= bit
+                                bit <<= 1
+                            for pname in kw_slots:
+                                if pname not in kwargs:
+                                    add |= bit
+                                bit <<= 1
+                            if add & ~cur:
+                                if cur == 0:
+                                    rec.touched_fids.append(fid)
+                                rec.cur_default_masks[fid] = cur | add
+                return orig(*args, **kwargs)
+
+            _wrapped._blast_orig = orig  # type: ignore[attr-defined]
+            return _wrapped
+
+        return _dec
 
     def register_reach_site(
         self, rel: str, lineno: int, col: int, end_lineno: int, end_col: int
@@ -168,26 +371,82 @@ class BuildTimeProfileRecorder:
     def switch_target(self, key: Any) -> None:
         """Flush current test's touched sites and switch active recording target."""
         if self.cur_key is not None:
+            ck = self.cur_key
             if self.touched_sids:
-                dest = self.records.get(self.cur_key)
+                dest = self.records.get(ck)
                 if dest is None:
                     dest = {}
-                    self.records[self.cur_key] = dest
+                    self.records[ck] = dest
                 flags = self.cur_flags
                 for sid in self.touched_sids:
                     dest[sid] = dest.get(sid, 0) | flags[sid]
                     flags[sid] = 0
                 self.touched_sids.clear()
             if self.touched_rsids:
-                rdest = self.reach_records.get(self.cur_key)
+                rdest = self.reach_records.get(ck)
                 if rdest is None:
                     rdest = set()
-                    self.reach_records[self.cur_key] = rdest
+                    self.reach_records[ck] = rdest
                 rflags = self.cur_reach
                 for rsid in self.touched_rsids:
                     rdest.add(rsid)
                     rflags[rsid] = 0
                 self.touched_rsids.clear()
+            # Flush Phase 4a range records
+            if self.cur_range_min or self.cur_range_unsafe:
+                rg_dest = self.range_records.get(ck)
+                if rg_dest is None:
+                    rg_dest = {}
+                    self.range_records[ck] = rg_dest
+                for sid in self.cur_range_unsafe:
+                    rg_dest[sid] = None
+                for sid, lo in self.cur_range_min.items():
+                    if sid in self.cur_range_unsafe:
+                        continue
+                    hi = self.cur_range_max[sid]
+                    prev_rg = rg_dest.get(sid, _MISSING_RG)
+                    if prev_rg is None:
+                        continue
+                    if prev_rg is _MISSING_RG:
+                        rg_dest[sid] = (lo, hi)
+                    else:
+                        rg_dest[sid] = (min(prev_rg[0], lo), max(prev_rg[1], hi))
+                self.cur_range_min.clear()
+                self.cur_range_max.clear()
+                self.cur_range_unsafe.clear()
+            # Flush Phase 4b const-equality records
+            if self.cur_const_vals or self.cur_const_unsafe:
+                cdest = self.const_records.get(ck)
+                if cdest is None:
+                    cdest = {}
+                    self.const_records[ck] = cdest
+                for sid in self.cur_const_unsafe:
+                    cdest[sid] = None
+                for sid, vset in self.cur_const_vals.items():
+                    if sid in self.cur_const_unsafe:
+                        continue
+                    prev_c = cdest.get(sid, _MISSING_RG)
+                    if prev_c is None:
+                        continue
+                    if prev_c is _MISSING_RG:
+                        cdest[sid] = set(vset)
+                    else:
+                        prev_c.update(vset)
+                        if len(prev_c) > _MAX_CONST_VALS_PER_TEST:
+                            cdest[sid] = None
+                self.cur_const_vals.clear()
+                self.cur_const_unsafe.clear()
+            # Flush Phase 4c default-argument usage records
+            if self.touched_fids:
+                ddest = self.default_records.get(ck)
+                if ddest is None:
+                    ddest = {}
+                    self.default_records[ck] = ddest
+                dmasks = self.cur_default_masks
+                for fid in self.touched_fids:
+                    ddest[fid] = ddest.get(fid, 0) | dmasks[fid]
+                    dmasks[fid] = 0
+                self.touched_fids.clear()
         self.cur_key = key
         self.active = key is not None
 
@@ -283,6 +542,53 @@ class BuildTimeProfileRecorder:
         if not self.active:
             self.inactive_sids.add(sid)
             return res
+
+        # Phase 4a: Ordered-comparison integer delta ranges (must run even when cur_flags saturated!)
+        if self.site_is_order[sid] and sid not in self.cur_range_unsafe:
+            if type(lhs) is int and type(rhs) is int:
+                d = lhs - rhs
+                if d < -_RANGE_CLAMP:
+                    d_lo, d_hi = _NEG_INF, -(_RANGE_CLAMP + 1)
+                elif d > _RANGE_CLAMP:
+                    d_lo, d_hi = _RANGE_CLAMP + 1, _POS_INF
+                else:
+                    d_lo = d_hi = d
+                prev_lo = self.cur_range_min.get(sid)
+                if prev_lo is None:
+                    self.cur_range_min[sid] = d_lo
+                    self.cur_range_max[sid] = d_hi
+                else:
+                    new_lo = d_lo if d_lo < prev_lo else prev_lo
+                    prev_hi = self.cur_range_max[sid]
+                    new_hi = d_hi if d_hi > prev_hi else prev_hi
+                    if new_lo == _NEG_INF and new_hi == _POS_INF:
+                        self.cur_range_unsafe.add(sid)
+                    else:
+                        if new_lo != prev_lo:
+                            self.cur_range_min[sid] = new_lo
+                        if new_hi != prev_hi:
+                            self.cur_range_max[sid] = new_hi
+            else:
+                self.cur_range_unsafe.add(sid)
+
+        # Phase 4b: Constant-equality observed value sets
+        cside = self.site_const_side[sid]
+        if cside >= 0 and sid not in self.cur_const_unsafe:
+            other_v = lhs if cside == 1 else rhs
+            const_v = rhs if cside == 1 else lhs
+            cv = _canonicalize_other_for_const(other_v, const_v)
+            if cv is None:
+                self.cur_const_unsafe.add(sid)
+            elif cv != ("n",) and cv != ("o",):
+                vset = self.cur_const_vals.get(sid)
+                if vset is None:
+                    self.cur_const_vals[sid] = {cv}
+                elif cv not in vset:
+                    if len(vset) >= _MAX_CONST_VALS_PER_TEST:
+                        self.cur_const_unsafe.add(sid)
+                        vset.clear()
+                    else:
+                        vset.add(cv)
 
         prev = self.cur_flags[sid]
         if prev == ALL_COMPARE_BITS:
@@ -390,17 +696,61 @@ def _has_walrus_or_yield(node: ast.AST) -> bool:
 
 
 class _SiteInstrumenter(ast.NodeTransformer):
-    """Instrument Compare, If/IfExp/While branch tests, and short-circuitable
-    sub-expressions (BoolOp.values[1:], IfExp.body, IfExp.orelse) inside function bodies."""
+    """Instrument Compare, If/IfExp/While branch tests, short-circuitable
+    sub-expressions (BoolOp.values[1:], IfExp.body, IfExp.orelse), and
+    undecorated functions/methods with default arguments."""
 
-    def __init__(self, rel: str, recorder: BuildTimeProfileRecorder, enable_reach: bool = True) -> None:
+    def __init__(
+        self,
+        rel: str,
+        recorder: BuildTimeProfileRecorder,
+        enable_reach: bool = True,
+        enable_defaults: bool = True,
+    ) -> None:
         self.rel = rel
         self.recorder = recorder
         self.enable_reach = enable_reach
+        self.enable_defaults = enable_defaults
         self._func_depth = 0
+        self._cls_stack: list[str] = []
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
+        node.bases = [self.visit(b) for b in node.bases]
+        node.keywords = [self.visit(k) for k in node.keywords]
+        node.decorator_list = [self.visit(d) for d in node.decorator_list]
+        self._cls_stack.append(node.name)
+        node.body = [self.visit(s) for s in node.body]
+        self._cls_stack.pop()
+        return node
+
+    def _maybe_attach_default_wrapper(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        if not self.enable_defaults or self._func_depth != 0 or node.decorator_list:
+            return
+        args = node.args
+        n_pos_defs = len(args.defaults)
+        kw_slots = tuple(a.arg for a, d in zip(args.kwonlyargs, args.kw_defaults) if d is not None)
+        if n_pos_defs == 0 and not kw_slots:
+            return
+        n_posonly = len(args.posonlyargs)
+        pos_params = [a.arg for a in args.posonlyargs] + [a.arg for a in args.args]
+        n_pos = len(pos_params)
+        start = n_pos - n_pos_defs
+        pos_slots = tuple((start + j, pos_params[start + j], (start + j) < n_posonly) for j in range(n_pos_defs))
+        if len(pos_slots) + len(kw_slots) > 60:
+            return
+        fq = ".".join((*self._cls_stack, node.name)) if self._cls_stack else node.name
+        fid = self.recorder.register_default_func(self.rel, fq, pos_slots, kw_slots)
+        dec = ast.Call(
+            func=ast.Name(id="__blast_dw__", ctx=ast.Load()),
+            args=[ast.Constant(value=fid)],
+            keywords=[],
+        )
+        ast.copy_location(dec, node)
+        node.decorator_list.append(dec)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
         node.decorator_list = [self.visit(d) for d in node.decorator_list]
+        self._maybe_attach_default_wrapper(node)
         self._func_depth += 1
         node.body = [self.visit(s) for s in node.body]
         self._func_depth -= 1
@@ -408,6 +758,7 @@ class _SiteInstrumenter(ast.NodeTransformer):
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
         node.decorator_list = [self.visit(d) for d in node.decorator_list]
+        self._maybe_attach_default_wrapper(node)
         self._func_depth += 1
         node.body = [self.visit(s) for s in node.body]
         self._func_depth -= 1
@@ -499,9 +850,18 @@ class _SiteInstrumenter(ast.NodeTransformer):
         ecol = getattr(node, "end_col_offset", None)
         if eln is None or ecol is None:
             return self.generic_visit(node)
+        is_order = op_code in (OP_LT, OP_LTE, OP_GT, OP_GTE)
+        const_side = -1
+        if op_code in (OP_EQ, OP_NOT_EQ):
+            if _canonicalize_const_ast(node.comparators[0]) is not None:
+                const_side = 1
+            elif _canonicalize_const_ast(node.left) is not None:
+                const_side = 0
         left = self.visit(node.left)
         right = self.visit(node.comparators[0])
-        sid = self.recorder.register_site(self.rel, ln, col, eln, ecol, is_compare=True)
+        sid = self.recorder.register_site(
+            self.rel, ln, col, eln, ecol, is_compare=True, is_order=is_order, const_side=const_side
+        )
         call = ast.Call(
             func=ast.Name(id="__blast_cp__", ctx=ast.Load()),
             args=[ast.Constant(value=sid), ast.Constant(value=op_code), left, right],
@@ -521,6 +881,7 @@ class _ProfilingLoader(importlib.abc.Loader):
         enable_reach: bool = True,
         mapping_recorder: Any = None,
         post_exec_hook: Any = None,
+        enable_defaults: bool = True,
     ) -> None:
         self.filepath = filepath
         self.rel = rel
@@ -529,6 +890,7 @@ class _ProfilingLoader(importlib.abc.Loader):
         self.enable_reach = enable_reach
         self.mapping_recorder = mapping_recorder
         self.post_exec_hook = post_exec_hook
+        self.enable_defaults = enable_defaults
 
     def create_module(self, spec: Any) -> Any:
         return None
@@ -541,12 +903,15 @@ class _ProfilingLoader(importlib.abc.Loader):
         tree = ast.parse(raw, filename=self.filepath)
         # Skip sqlglot/typing/*.py so test_typing.py sees exact unmodified bytecode/co_varnames!
         if not self.rel.startswith("sqlglot/typing/"):
-            tree = _SiteInstrumenter(self.rel, self.recorder, enable_reach=self.enable_reach).visit(tree)
+            tree = _SiteInstrumenter(
+                self.rel, self.recorder, enable_reach=self.enable_reach, enable_defaults=self.enable_defaults
+            ).visit(tree)
             ast.fix_missing_locations(tree)
             # Bind probes directly in module globals for fast LOAD_GLOBAL lookup
             module.__dict__["__blast_bp__"] = self.recorder.branch_probe
             module.__dict__["__blast_cp__"] = self.recorder.compare_probe
             module.__dict__["__blast_rm__"] = self.recorder.reach_mark
+            module.__dict__["__blast_dw__"] = self.recorder.wrap_default_func
         code = compile(tree, self.filepath, "exec")
         mr = self.mapping_recorder
         if mr is not None:
@@ -570,12 +935,14 @@ class ProfilingMetaPathFinder(importlib.abc.MetaPathFinder):
         enable_reach: bool = True,
         mapping_recorder: Any = None,
         post_exec_hook: Any = None,
+        enable_defaults: bool = True,
     ) -> None:
         self.root = sqlglot_dir.resolve()
         self.recorder = recorder
         self.enable_reach = enable_reach
         self.mapping_recorder = mapping_recorder
         self.post_exec_hook = post_exec_hook
+        self.enable_defaults = enable_defaults
 
     def find_spec(self, fullname: str, path: Any, target: Any = None) -> Any:
         if fullname != "sqlglot" and not fullname.startswith("sqlglot."):
@@ -592,6 +959,7 @@ class ProfilingMetaPathFinder(importlib.abc.MetaPathFinder):
                 self.enable_reach,
                 self.mapping_recorder,
                 self.post_exec_hook,
+                self.enable_defaults,
             )
             return importlib.machinery.ModuleSpec(fullname, loader, origin=str(pkg_init), is_package=True)
         mod_file = self.root / f"{rel_base}.py"
@@ -605,6 +973,7 @@ class ProfilingMetaPathFinder(importlib.abc.MetaPathFinder):
                 self.enable_reach,
                 self.mapping_recorder,
                 self.post_exec_hook,
+                self.enable_defaults,
             )
             return importlib.machinery.ModuleSpec(fullname, loader, origin=str(mod_file), is_package=False)
         return None
@@ -659,6 +1028,195 @@ def _spans_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -
     return a_start < b_end and b_start < a_end
 
 
+def _extract_exact_int(node: ast.AST) -> int | None:
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        if isinstance(node.operand, ast.Constant) and type(node.operand.value) is int:
+            return -node.operand.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd):
+        if isinstance(node.operand, ast.Constant) and type(node.operand.value) is int:
+            return node.operand.value
+    return None
+
+
+def _is_len_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "len"
+        and len(node.args) == 1
+        and not node.keywords
+    )
+
+
+def _split_safe_int_linear(node: ast.AST) -> tuple[str, int, bool]:
+    """Return `(base_dump, int_offset, is_binop_shift)` for exact integer literals
+    or `len(x) +/- C`."""
+    iv = _extract_exact_int(node)
+    if iv is not None:
+        return ("", iv, False)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
+        rv = _extract_exact_int(node.right)
+        if rv is not None and _is_len_call(node.left):
+            return (_dump(node.left), rv if isinstance(node.op, ast.Add) else -rv, True)
+    return (_dump(node), 0, False)
+
+
+def _extract_ordered_threshold_shift(
+    old_expr: ast.AST, new_expr: ast.AST
+) -> tuple[type[ast.cmpop], type[ast.cmpop], int] | None:
+    """If `old_expr` and `new_expr` are same-direction single-op ordered comparisons
+    differing only by a constant integer shift `delta_shift` such that
+    `(lhs_new - rhs_new) == (lhs_old - rhs_old) + delta_shift`, return
+    `(op_old, op_new, delta_shift)`. Otherwise return None."""
+    if not (
+        isinstance(old_expr, ast.Compare)
+        and isinstance(new_expr, ast.Compare)
+        and len(old_expr.ops) == 1
+        and len(new_expr.ops) == 1
+        and len(old_expr.comparators) == 1
+        and len(new_expr.comparators) == 1
+    ):
+        return None
+    op1 = type(old_expr.ops[0])
+    op2 = type(new_expr.ops[0])
+    same_dir = (op1 in (ast.Lt, ast.LtE) and op2 in (ast.Lt, ast.LtE)) or (
+        op1 in (ast.Gt, ast.GtE) and op2 in (ast.Gt, ast.GtE)
+    )
+    if not same_dir:
+        return None
+    l1_b, l1_c, _ = _split_safe_int_linear(old_expr.left)
+    r1_b, r1_c, _ = _split_safe_int_linear(old_expr.comparators[0])
+    l2_b, l2_c, _ = _split_safe_int_linear(new_expr.left)
+    r2_b, r2_c, _ = _split_safe_int_linear(new_expr.comparators[0])
+    if l1_b != l2_b or r1_b != r2_b:
+        return None
+    # At least one side must be an actual variable expression (not `1 < 2` -> `1 < 3`)
+    if not l1_b and not r1_b:
+        return None
+    delta_shift = (l2_c - r2_c) - (l1_c - r1_c)
+    return (op1, op2, delta_shift)
+
+
+def _extract_const_eq_edit(
+    old_expr: ast.AST, new_expr: ast.AST
+) -> tuple[tuple[Any, ...], tuple[Any, ...]] | None:
+    """If `old_expr` and `new_expr` are single-op `==` or `!=` comparisons with the
+    SAME operator, SAME non-constant operand, and SAME-family canonical constant
+    operands `c1 != c2`, return `(c1, c2)`. Otherwise return None."""
+    if not (
+        isinstance(old_expr, ast.Compare)
+        and isinstance(new_expr, ast.Compare)
+        and len(old_expr.ops) == 1
+        and len(new_expr.ops) == 1
+        and len(old_expr.comparators) == 1
+        and len(new_expr.comparators) == 1
+        and type(old_expr.ops[0]) is type(new_expr.ops[0])
+        and isinstance(old_expr.ops[0], (ast.Eq, ast.NotEq))
+    ):
+        return None
+    # Check RHS constant swap (x == C1 -> x == C2)
+    if _dump(old_expr.left) == _dump(new_expr.left):
+        c1 = _canonicalize_const_ast(old_expr.comparators[0])
+        c2 = _canonicalize_const_ast(new_expr.comparators[0])
+        if c1 is not None and c2 is not None and c1 != c2:
+            if c1[0] == c2[0] and (c1[0] != "e" or c1[1] == c2[1]):
+                return (c1, c2)
+    # Check LHS constant swap (C1 == x -> C2 == x)
+    if _dump(old_expr.comparators[0]) == _dump(new_expr.comparators[0]):
+        c1 = _canonicalize_const_ast(old_expr.left)
+        c2 = _canonicalize_const_ast(new_expr.left)
+        if c1 is not None and c2 is not None and c1 != c2:
+            if c1[0] == c2[0] and (c1[0] != "e" or c1[1] == c2[1]):
+                return (c1, c2)
+    return None
+
+
+def _is_pure_default_ast(node: ast.AST, existing_sym_dumps: set[str] | None = None) -> bool:
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Not)):
+        return isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float, bool))
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_is_pure_default_ast(e, existing_sym_dumps) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            k is not None and _is_pure_default_ast(k, existing_sym_dumps) and _is_pure_default_ast(v, existing_sym_dumps)
+            for k, v in zip(node.keys, node.values)
+        )
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        return existing_sym_dumps is not None and _dump(node) in existing_sym_dumps
+    return False
+
+
+def find_default_only_param_edits(
+    old_fn: ast.AST,
+    new_fn: ast.AST,
+    old_tree: ast.AST,
+) -> list[str] | None:
+    """If `old_fn` and `new_fn` are undecorated functions whose ONLY difference is
+    the default value expression(s) of one or more existing parameters (all new defaults
+    import-time pure; body, decorators, param names/order/annotations, docstring identical),
+    return the list of changed parameter names. Otherwise return None."""
+    if not isinstance(old_fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or type(old_fn) is not type(new_fn):
+        return None
+    if old_fn.decorator_list or new_fn.decorator_list:
+        return None
+    if old_fn.name != new_fn.name:
+        return None
+    if (old_fn.returns is None) != (new_fn.returns is None):
+        return None
+    if old_fn.returns is not None and new_fn.returns is not None and _dump(old_fn.returns) != _dump(new_fn.returns):
+        return None
+    if [_dump(s) for s in old_fn.body] != [_dump(s) for s in new_fn.body]:
+        return None
+
+    oa, na = old_fn.args, new_fn.args
+    if (
+        [_dump(x) for x in oa.posonlyargs] != [_dump(x) for x in na.posonlyargs]
+        or [_dump(x) for x in oa.args] != [_dump(x) for x in na.args]
+        or [_dump(x) for x in oa.kwonlyargs] != [_dump(x) for x in na.kwonlyargs]
+        or (oa.vararg is None) != (na.vararg is None)
+        or (oa.vararg is not None and na.vararg is not None and _dump(oa.vararg) != _dump(na.vararg))
+        or (oa.kwarg is None) != (na.kwarg is None)
+        or (oa.kwarg is not None and na.kwarg is not None and _dump(oa.kwarg) != _dump(na.kwarg))
+        or len(oa.defaults) != len(na.defaults)
+        or len(oa.kw_defaults) != len(na.kw_defaults)
+    ):
+        return None
+
+    pos_params = [a.arg for a in oa.posonlyargs] + [a.arg for a in oa.args]
+    start = len(pos_params) - len(oa.defaults)
+    changed: list[str] = []
+    sym_dumps: set[str] | None = None
+
+    def check_pure(nd: ast.AST) -> bool:
+        nonlocal sym_dumps
+        if _is_pure_default_ast(nd):
+            return True
+        if sym_dumps is None:
+            sym_dumps = {_dump(sub) for sub in ast.walk(old_tree) if isinstance(sub, (ast.Name, ast.Attribute))}
+        return _is_pure_default_ast(nd, sym_dumps)
+
+    for j, (od, nd) in enumerate(zip(oa.defaults, na.defaults)):
+        if _dump(od) != _dump(nd):
+            if not check_pure(nd):
+                return None
+            changed.append(pos_params[start + j])
+
+    for ka, od, nd in zip(oa.kwonlyargs, oa.kw_defaults, na.kw_defaults):
+        if (od is None) != (nd is None):
+            # Adding or removing a default changes required-ness -> reject!
+            return None
+        if od is not None and nd is not None and _dump(od) != _dump(nd):
+            if not check_pure(nd):
+                return None
+            changed.append(ka.arg)
+
+    return changed if changed else None
+
+
 def find_expr_edits(
     old_tree: ast.AST,
     new_tree: ast.AST,
@@ -688,6 +1246,24 @@ def find_expr_edits(
                 diffs.append((a, b, is_branch, anc))
                 return len(diffs) <= max_diffs
             return False
+
+        # Phase 4: Keep enclosing single-op Compare intact for ordered-threshold shifts
+        # (e.g. `len(x) > 1` -> `len(x) > 2`) and constant-equality swaps (`x == "A"` -> `x == "B"`)
+        # so the site span matches the instrumented Compare node rather than the constant leaf.
+        if (
+            in_func
+            and isinstance(a, ast.Compare)
+            and isinstance(b, ast.Compare)
+            and _dump(a) != _dump(b)
+            and (
+                _extract_ordered_threshold_shift(a, b) is not None
+                or _extract_const_eq_edit(a, b) is not None
+            )
+        ):
+            if _has_walrus_or_yield(a) or _has_walrus_or_yield(b):
+                return False
+            diffs.append((a, b, is_branch, anc))
+            return len(diffs) <= max_diffs
 
         is_func_def = isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef))
         next_anc = anc
@@ -887,6 +1463,59 @@ def _prove_value_equiv_on_seen(
     return 0
 
 
+def _prove_p4_range_or_const(
+    old_expr: ast.expr,
+    new_expr: ast.expr,
+    eligible: int,
+    range_prof: tuple[int, tuple[tuple[int | None, int | None, int], ...]] | None,
+    const_prof: tuple[int, dict[tuple[Any, ...], int]] | None,
+) -> int:
+    """Apply Phase 4 Rules P7 (ordered comparison delta ranges) and P8 (constant-equality
+    observed value sets) to tests in `eligible`."""
+    if not eligible:
+        return 0
+
+    # --- Rule P7: Ordered comparison integer threshold shift ---
+    if range_prof is not None:
+        shift_info = _extract_ordered_threshold_shift(old_expr, new_expr)
+        if shift_info is not None:
+            op1, op2, delta_shift = shift_info
+            non_int_unsafe, buckets = range_prof
+            cand = eligible & ~non_int_unsafe
+            if cand:
+                if op1 in (ast.Lt, ast.LtE):
+                    c1 = -1 if op1 is ast.Lt else 0
+                    c2 = (-1 if op2 is ast.Lt else 0) - delta_shift
+                    if c1 == c2:
+                        return cand
+                    bad_lo = min(c1, c2) + 1
+                    bad_hi = max(c1, c2)
+                else:
+                    c1 = 1 if op1 is ast.Gt else 0
+                    c2 = (1 if op2 is ast.Gt else 0) - delta_shift
+                    if c1 == c2:
+                        return cand
+                    bad_lo = min(c1, c2)
+                    bad_hi = max(c1, c2) - 1
+
+                safe_bits = 0
+                for lo, hi, bits in buckets:
+                    if (hi is not None and hi < bad_lo) or (lo is not None and lo > bad_hi):
+                        safe_bits |= bits
+                return cand & safe_bits
+
+    # --- Rule P8: Constant-equality observed value set ---
+    if const_prof is not None:
+        ceq = _extract_const_eq_edit(old_expr, new_expr)
+        if ceq is not None:
+            c1, c2 = ceq
+            overflow_bits, val_to_bits = const_prof
+            unsafe = overflow_bits | val_to_bits.get(c1, 0) | val_to_bits.get(c2, 0)
+            return eligible & ~unsafe
+
+    return 0
+
+
 def prove_unchanged_test_bits(
     old_tree: ast.AST,
     new_tree: ast.AST,
@@ -896,6 +1525,9 @@ def prove_unchanged_test_bits(
     unprofiled_test_bits: int = 0,
     enable_reach: bool = True,
     enable_multisite: bool = True,
+    file_range_profiles: dict[tuple[int, ...], tuple[int, tuple[tuple[int | None, int | None, int], ...]]] | None = None,
+    file_const_profiles: dict[tuple[int, ...], tuple[int, dict[tuple[Any, ...], int]]] | None = None,
+    enable_p4_ranges: bool = True,
 ) -> int:
     """Return bitset of tests in `candidate_bits` whose OWN recorded profile(s)
     mathematically prove ALL edited expression sites in this file cannot change
@@ -906,7 +1538,7 @@ def prove_unchanged_test_bits(
     - Multi-site conjunction: test T is proven unchanged ONLY IF EVERY edited site
       in the file is either (a) unreached by T (on an instrumented, stable,
       non-import-time site, excluding unprofiled/subprocess tests) OR (b) proven
-      value-equivalent for T by P1..P6.
+      value-equivalent for T by P1..P6 or (when enabled) P7..P8.
     - Any missing/unstable profile keeps all tests for that site -> 0.
     """
     if not candidate_bits:
@@ -923,6 +1555,8 @@ def prove_unchanged_test_bits(
 
     f_expr = file_profiles or {}
     f_reach = file_reach_profiles or {}
+    f_range = file_range_profiles or {}
+    f_const = file_const_profiles or {}
     safe_reach_mask = candidate_bits & ~unprofiled_test_bits
 
     # Conjunction across ALL modified sites in this file
@@ -936,13 +1570,7 @@ def prove_unchanged_test_bits(
 
         site_proven = 0
 
-        # 1. Sub-expression reachability proof:
-        #    - `reach_seen` / ancestor `aseen` ran BEFORE evaluating the sub-expression
-        #      (via `__blast_rm__(rsid) or <expr>`), so `T not in seen` is 100% sound
-        #      even if `<expr>` could raise an exception.
-        #    - `prof[0]` ran AFTER evaluating sub-operands, so `T not in prof[0]` is
-        #      only used when `old_expr` and `new_expr` evaluate identical prefix/operands
-        #      before the changed operator (Compare op-only swap, or `E -> E and/or X`).
+        # 1. Sub-expression reachability proof
         if enable_reach:
             if reach_seen is not None:
                 site_proven |= safe_reach_mask & ~reach_seen
@@ -959,10 +1587,17 @@ def prove_unchanged_test_bits(
                     and len(new_expr.ops) == 1
                     and len(old_expr.comparators) == 1
                     and len(new_expr.comparators) == 1
-                    and _dump(old_expr.left) == _dump(new_expr.left)
-                    and _dump(old_expr.comparators[0]) == _dump(new_expr.comparators[0])
                 ):
-                    same_prefix = True
+                    if _dump(old_expr.left) == _dump(new_expr.left) and _dump(old_expr.comparators[0]) == _dump(
+                        new_expr.comparators[0]
+                    ):
+                        same_prefix = True
+                    elif enable_p4_ranges and (
+                        _extract_ordered_threshold_shift(old_expr, new_expr) is not None
+                        or _extract_const_eq_edit(old_expr, new_expr) is not None
+                    ):
+                        # Pure constant / len+/-C operand swap evaluates identical non-const operand
+                        same_prefix = True
                 elif (
                     isinstance(new_expr, ast.BoolOp)
                     and len(new_expr.values) >= 2
@@ -972,11 +1607,20 @@ def prove_unchanged_test_bits(
                 if same_prefix:
                     site_proven |= safe_reach_mask & ~prof[0]
 
-        # 2. Value-equivalence proof (P1..P6) for tests that DID reach `site`
+        # 2. Value-equivalence proof (P1..P6, plus P7..P8 when enabled) for tests that DID reach `site`
         if prof is not None:
             eligible = candidate_bits & prof[0]
             if eligible:
-                site_proven |= _prove_value_equiv_on_seen(old_expr, new_expr, is_branch, prof, eligible)
+                v_ok = _prove_value_equiv_on_seen(old_expr, new_expr, is_branch, prof, eligible)
+                if not v_ok and enable_p4_ranges:
+                    v_ok = _prove_p4_range_or_const(
+                        old_expr,
+                        new_expr,
+                        eligible & ~unprofiled_test_bits,
+                        f_range.get(site4),
+                        f_const.get(site4),
+                    )
+                site_proven |= v_ok
 
         file_proven &= site_proven
         if not file_proven:

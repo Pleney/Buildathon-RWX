@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import builtins
 import concurrent.futures
+import inspect
 import os
 import pickle
 import subprocess
@@ -76,9 +77,17 @@ class _ProfilePlugin:
 
     def pytest_configure(self, config: Any) -> None:
         concurrent.futures.ProcessPoolExecutor = bm._SyncExecutor  # type: ignore[misc]
+        _orig_gfas = inspect.getfullargspec
+        if not getattr(_orig_gfas, "_blast_wrapped", False):
+            def _blast_getfullargspec(func: Any) -> Any:
+                return _orig_gfas(getattr(func, "_blast_orig", func))
+
+            _blast_getfullargspec._blast_wrapped = True  # type: ignore[attr-defined]
+            inspect.getfullargspec = _blast_getfullargspec  # type: ignore[assignment]
         builtins.__blast_bp__ = self.recorder.branch_probe  # type: ignore[attr-defined]
         builtins.__blast_cp__ = self.recorder.compare_probe  # type: ignore[attr-defined]
         builtins.__blast_rm__ = self.recorder.reach_mark  # type: ignore[attr-defined]
+        builtins.__blast_dw__ = self.recorder.wrap_default_func  # type: ignore[attr-defined]
         sys.meta_path.insert(
             0,
             ep.ProfilingMetaPathFinder(
@@ -87,6 +96,7 @@ class _ProfilePlugin:
                 enable_reach=True,
                 mapping_recorder=self.mapping_recorder,
                 post_exec_hook=self._post_exec_hook,
+                enable_defaults=True,
             ),
         )
         # Capture functions executed during module import / collection (turned off once tests start!)
@@ -217,6 +227,38 @@ def run_single_pass(sqlglot_dir: Path, map_path: Path, run_out: Path) -> None:
             fdst = mapping_recorder.flag_records.setdefault(nid, {})
             for tid, fl in mapping_recorder.flag_records[ck].items():
                 fdst[tid] = fdst.get(tid, 0) | fl
+        if ck in recorder.range_records:
+            rgdst = recorder.range_records.setdefault(nid, {})
+            for sid, rg in recorder.range_records[ck].items():
+                if rg is None:
+                    rgdst[sid] = None
+                else:
+                    prev = rgdst.get(sid, ep._MISSING_RG)
+                    if prev is None:
+                        continue
+                    if prev is ep._MISSING_RG:
+                        rgdst[sid] = rg
+                    else:
+                        rgdst[sid] = (min(prev[0], rg[0]), max(prev[1], rg[1]))
+        if ck in recorder.const_records:
+            cdst = recorder.const_records.setdefault(nid, {})
+            for sid, vs in recorder.const_records[ck].items():
+                if vs is None:
+                    cdst[sid] = None
+                else:
+                    prev = cdst.get(sid, ep._MISSING_RG)
+                    if prev is None:
+                        continue
+                    if prev is ep._MISSING_RG:
+                        cdst[sid] = set(vs)
+                    else:
+                        prev.update(vs)
+                        if len(prev) > ep._MAX_CONST_VALS_PER_TEST:
+                            cdst[sid] = None
+        if ck in recorder.default_records:
+            ddst = recorder.default_records.setdefault(nid, {})
+            for fid, dm in recorder.default_records[ck].items():
+                ddst[fid] = ddst.get(fid, 0) | dm
 
     # Pack into bitsets keyed by full 4-tuple span (rel, ln, col, eln, ecol)
     inactive_expr = {
@@ -411,6 +453,121 @@ def run_single_pass(sqlglot_dir: Path, map_path: Path, run_out: Path) -> None:
 
     defined_dict_tables = mp.scan_defined_dict_tables(sqlglot_dir)
 
+    # Pack Phase 4a: range_profiles (keyed by (rel, ln, col, eln, ecol))
+    rg_unsafe_acc: dict[tuple[str, int, int, int, int], int] = {}
+    rg_buckets_acc: dict[tuple[str, int, int, int, int], dict[tuple[int | None, int | None], int]] = {}
+    for nid, sid_map in recorder.range_records.items():
+        if not isinstance(nid, str):
+            continue
+        idx = id_to_idx.get(nid)
+        if idx is None:
+            continue
+        bit = 1 << idx
+        for sid, rg in sid_map.items():
+            rel, ln, col, eln, ecol, _ = recorder.sites[sid]
+            key = (rel, ln, col, eln, ecol)
+            if key in inactive_expr:
+                continue
+            if rg is None:
+                rg_unsafe_acc[key] = rg_unsafe_acc.get(key, 0) | bit
+            else:
+                lo = None if rg[0] <= ep._NEG_INF else rg[0]
+                hi = None if rg[1] >= ep._POS_INF else rg[1]
+                if lo is None and hi is None:
+                    rg_unsafe_acc[key] = rg_unsafe_acc.get(key, 0) | bit
+                else:
+                    bmap = rg_buckets_acc.setdefault(key, {})
+                    bmap[(lo, hi)] = bmap.get((lo, hi), 0) | bit
+
+    range_profiles: dict[tuple[str, int, int, int, int], tuple[int, tuple[tuple[int | None, int | None, int], ...]]] = {}
+    for sid, (rel, ln, col, eln, ecol, _ic) in enumerate(recorder.sites):
+        if not recorder.site_is_order[sid]:
+            continue
+        key = (rel, ln, col, eln, ecol)
+        if key in inactive_expr:
+            continue
+        u_bits = rg_unsafe_acc.get(key, 0)
+        bmap = rg_buckets_acc.get(key, {})
+        buckets = tuple(
+            (lo, hi, bits)
+            for (lo, hi), bits in sorted(
+                bmap.items(),
+                key=lambda kv: (-10**10 if kv[0][0] is None else kv[0][0], 10**10 if kv[0][1] is None else kv[0][1]),
+            )
+        )
+        range_profiles[key] = (u_bits, buckets)
+
+    # Pack Phase 4b: const_profiles (keyed by (rel, ln, col, eln, ecol))
+    c_over_acc: dict[tuple[str, int, int, int, int], int] = {}
+    c_vals_acc: dict[tuple[str, int, int, int, int], dict[tuple[Any, ...], int]] = {}
+    for nid, sid_map in recorder.const_records.items():
+        if not isinstance(nid, str):
+            continue
+        idx = id_to_idx.get(nid)
+        if idx is None:
+            continue
+        bit = 1 << idx
+        for sid, vs in sid_map.items():
+            rel, ln, col, eln, ecol, _ = recorder.sites[sid]
+            key = (rel, ln, col, eln, ecol)
+            if key in inactive_expr:
+                continue
+            if vs is None:
+                c_over_acc[key] = c_over_acc.get(key, 0) | bit
+            else:
+                vmap = c_vals_acc.setdefault(key, {})
+                for cv in vs:
+                    vmap[cv] = vmap.get(cv, 0) | bit
+
+    const_profiles: dict[tuple[str, int, int, int, int], tuple[int, dict[tuple[Any, ...], int]]] = {}
+    for sid, (rel, ln, col, eln, ecol, _ic) in enumerate(recorder.sites):
+        if recorder.site_const_side[sid] < 0:
+            continue
+        key = (rel, ln, col, eln, ecol)
+        if key in inactive_expr:
+            continue
+        ov = c_over_acc.get(key, 0)
+        vmap = c_vals_acc.get(key, {})
+        if len(vmap) > ep.MAX_CONST_VALS_PER_SITE:
+            # Keep top-N values by test count (tie-broken deterministically by key); overflow rest into ov
+            ranked = sorted(vmap.items(), key=lambda kv: (-kv[1].bit_count(), repr(kv[0])))
+            kept = dict(ranked[: ep.MAX_CONST_VALS_PER_SITE])
+            for _, obits in ranked[ep.MAX_CONST_VALS_PER_SITE :]:
+                ov |= obits
+            vmap = kept
+        const_profiles[key] = (ov, dict(sorted(vmap.items(), key=lambda kv: repr(kv[0]))))
+
+    # Pack Phase 4c: default_arg_profiles (keyed by (rel, fq))
+    num_fids = len(recorder.default_funcs)
+    def_slot_bits: list[list[int]] = [
+        [0] * (len(ps) + len(ks)) for _r, _q, ps, ks in recorder.default_funcs
+    ]
+    for nid, fid_map in recorder.default_records.items():
+        if not isinstance(nid, str):
+            continue
+        idx = id_to_idx.get(nid)
+        if idx is None:
+            continue
+        bit = 1 << idx
+        for fid, dmask in fid_map.items():
+            if fid in recorder.duplicate_default_fids:
+                continue
+            slots = def_slot_bits[fid]
+            for si in range(len(slots)):
+                if dmask & (1 << si):
+                    slots[si] |= bit
+
+    default_arg_profiles: dict[tuple[str, str], tuple[frozenset[str], dict[str, int]]] = {}
+    for fid in range(num_fids):
+        if fid in recorder.duplicate_default_fids:
+            continue
+        rel, fq, pos_slots, kw_slots = recorder.default_funcs[fid]
+        pnames = [pn for _idx, pn, _po in pos_slots] + list(kw_slots)
+        imp_mask = recorder.import_default_masks[fid]
+        imp_params = frozenset(pnames[si] for si in range(len(pnames)) if imp_mask & (1 << si))
+        pmap = {pnames[si]: def_slot_bits[fid][si] for si in range(len(pnames)) if def_slot_bits[fid][si]}
+        default_arg_profiles[(rel, fq)] = (imp_params, pmap)
+
     active_collected = [n for n in plugin.test_nodeids if n not in plugin.skipped_nodeids]
     missing_from_run = sorted(set(test_ids) - set(active_collected))
 
@@ -422,6 +579,9 @@ def run_single_pass(sqlglot_dir: Path, map_path: Path, run_out: Path) -> None:
         "import_time_funcs": import_time_funcs,
         "mapping_profiles": mapping_profiles,
         "defined_dict_tables": defined_dict_tables,
+        "range_profiles": range_profiles,
+        "const_profiles": const_profiles,
+        "default_arg_profiles": default_arg_profiles,
         "missing_from_run": missing_from_run,
         "elapsed": elapsed,
     }
@@ -430,7 +590,9 @@ def run_single_pass(sqlglot_dir: Path, map_path: Path, run_out: Path) -> None:
         f"[build_profiles] wrote {run_out}: expr_sites={len(expr_profiles)} "
         f"(inactive={len(inactive_expr)}), reach_sites={len(reach_profiles)} "
         f"(inactive={len(inactive_reach)}), mapping_tables={len(mapping_profiles)} "
-        f"(miss_overflow={miss_overflow_tables}), missing_tests={len(missing_from_run)}",
+        f"(miss_overflow={miss_overflow_tables}), range={len(range_profiles)}, "
+        f"const={len(const_profiles)}, defaults={len(default_arg_profiles)}, "
+        f"missing_tests={len(missing_from_run)}",
         file=sys.stderr,
         flush=True,
     )
@@ -478,6 +640,42 @@ def merge_and_check_stability(map_path: Path, run1_path: Path, run2_path: Path, 
         else:
             unstable_mappings.append(key)
 
+    rg1 = r1.get("range_profiles", {})
+    rg2 = r2.get("range_profiles", {})
+    stable_ranges: dict[str, dict[tuple[int, int, int, int], Any]] = defaultdict(dict)
+    unstable_ranges: list[tuple[str, int, int, int, int]] = []
+    for key in sorted(set(rg1.keys()) | set(rg2.keys())):
+        if key in inact_expr:
+            continue
+        if key in rg1 and key in rg2 and rg1[key] == rg2[key]:
+            rel, ln, col, eln, ecol = key
+            stable_ranges[rel][(ln, col, eln, ecol)] = rg1[key]
+        else:
+            unstable_ranges.append(key)
+
+    cp1 = r1.get("const_profiles", {})
+    cp2 = r2.get("const_profiles", {})
+    stable_consts: dict[str, dict[tuple[int, int, int, int], Any]] = defaultdict(dict)
+    unstable_consts: list[tuple[str, int, int, int, int]] = []
+    for key in sorted(set(cp1.keys()) | set(cp2.keys())):
+        if key in inact_expr:
+            continue
+        if key in cp1 and key in cp2 and cp1[key] == cp2[key]:
+            rel, ln, col, eln, ecol = key
+            stable_consts[rel][(ln, col, eln, ecol)] = cp1[key]
+        else:
+            unstable_consts.append(key)
+
+    dp1 = r1.get("default_arg_profiles", {})
+    dp2 = r2.get("default_arg_profiles", {})
+    stable_defaults: dict[tuple[str, str], Any] = {}
+    unstable_defaults: list[tuple[str, str]] = []
+    for key in sorted(set(dp1.keys()) | set(dp2.keys())):
+        if key in dp1 and key in dp2 and dp1[key] == dp2[key]:
+            stable_defaults[key] = dp1[key]
+        else:
+            unstable_defaults.append(key)
+
     defined_dict_tables = frozenset(
         r1.get("defined_dict_tables", set()) | r2.get("defined_dict_tables", set())
     )
@@ -493,13 +691,16 @@ def merge_and_check_stability(map_path: Path, run1_path: Path, run2_path: Path, 
     )
 
     payload = {
-        "version": 4,
+        "version": 5,
         "commit": map_data["commit"],
         "test_ids": map_data["test_ids"],
         "expr_profiles": {k: dict(v) for k, v in stable_expr.items()},
         "reach_profiles": {k: dict(v) for k, v in stable_reach.items()},
         "mapping_profiles": stable_mappings,
         "defined_dict_tables": defined_dict_tables,
+        "range_profiles": {k: dict(v) for k, v in stable_ranges.items()},
+        "const_profiles": {k: dict(v) for k, v in stable_consts.items()},
+        "default_arg_profiles": stable_defaults,
         "import_time_funcs": dict(import_funcs_by_file),
         "unprofiled_test_ids": unprofiled,
     }
@@ -510,15 +711,19 @@ def merge_and_check_stability(map_path: Path, run1_path: Path, run2_path: Path, 
 
     n_expr = sum(len(v) for v in stable_expr.values())
     n_reach = sum(len(v) for v in stable_reach.values())
-    mp_raw = len(pickle.dumps(stable_mappings, protocol=4))
-    mp_comp = len(zlib.compress(pickle.dumps(stable_mappings, protocol=4), level=9))
+    n_range = sum(len(v) for v in stable_ranges.values())
+    n_const = sum(len(v) for v in stable_consts.values())
+    def _sub_mb(obj: Any) -> float:
+        return len(zlib.compress(pickle.dumps(obj, protocol=4), level=9)) / 1e6
     print(
         f"[build_profiles] STABILITY DIFF COMPLETE:\n"
         f"  Run 1: {r1['elapsed']:.1f}s | Run 2: {r2['elapsed']:.1f}s\n"
         f"  Expr sites:     {n_expr} stable, {len(unstable_expr)} unstable (dropped), {len(inact_expr)} import-time (excluded)\n"
         f"  Reach sites:    {n_reach} stable, {len(unstable_reach)} unstable (dropped), {len(inact_reach)} import-time (excluded)\n"
-        f"  Mapping tables: {len(stable_mappings)} stable, {len(unstable_mappings)} unstable (dropped) "
-        f"(sub-size {mp_comp/1e6:.2f} MB comp / {mp_raw/1e6:.2f} MB raw)\n"
+        f"  Mapping tables: {len(stable_mappings)} stable, {len(unstable_mappings)} unstable (dropped) ({_sub_mb(stable_mappings):.2f} MB)\n"
+        f"  Range sites:    {n_range} stable, {len(unstable_ranges)} unstable (dropped) ({_sub_mb(dict(stable_ranges)):.2f} MB)\n"
+        f"  Const-eq sites: {n_const} stable, {len(unstable_consts)} unstable (dropped) ({_sub_mb(dict(stable_consts)):.2f} MB)\n"
+        f"  Default funcs:  {len(stable_defaults)} stable, {len(unstable_defaults)} unstable (dropped) ({_sub_mb(stable_defaults):.2f} MB)\n"
         f"  Unprofiled tests: {unprofiled}\n"
         f"  profiles.pkl.gz: {len(comp)/1e6:.2f} MB compressed ({len(raw)/1e6:.2f} MB raw)",
         file=sys.stderr,
@@ -530,6 +735,12 @@ def merge_and_check_stability(map_path: Path, run1_path: Path, run2_path: Path, 
         print(f"  Sample unstable reach sites: {unstable_reach[:10]}", file=sys.stderr)
     if unstable_mappings:
         print(f"  Sample unstable mapping tables: {unstable_mappings[:10]}", file=sys.stderr)
+    if unstable_ranges:
+        print(f"  Sample unstable range sites: {unstable_ranges[:10]}", file=sys.stderr)
+    if unstable_consts:
+        print(f"  Sample unstable const sites: {unstable_consts[:10]}", file=sys.stderr)
+    if unstable_defaults:
+        print(f"  Sample unstable default funcs: {unstable_defaults[:10]}", file=sys.stderr)
 
 
 def main() -> None:
