@@ -33,10 +33,18 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+import packer  # noqa: E402
+
 # Default verification budgets
 DEFAULT_VERIFIER_CONFIG: dict[str, Any] = {
     # Skip verification when candidate set is larger than this (broad fallback)
     "max_candidates_to_verify": 450,
+    # Skip verification when static selection cost (s) is already at or below this threshold
+    "min_static_cost_to_verify": 0.0,
+    # Minimum ratio of max_possible_saving / est_cpu_cost required to fork and verify
+    "min_roi_ratio": 1.0,
+    # Estimated fixed fork + sqlglot import CPU overhead per verified commit (s)
+    "fork_overhead_sec": 0.14,
     # Do not run any single test whose recorded duration exceeds this (seconds)
     "max_single_test_sec": 1.60,
     # If only 1 candidate remains after all others passed, allow running up to this duration
@@ -62,6 +70,207 @@ DEFAULT_VERIFIER_CONFIG: dict[str, Any] = {
     # Skip verifying fixture-only commits (almost always fail their single test)
     "skip_fixture_only": True,
 }
+
+
+def _pack_cost_sec(cands: list[tuple[int, str, float]]) -> float:
+    """Exact packed cost (max_load + 2k) in seconds for a list of (num, nodeid, dur_sec)."""
+    if not cands:
+        return 0.0
+    dur_ms = {n: int(d * 1000.0 + 0.5) for n, _, d in cands}
+    nums = [n for n, _, _ in cands]
+    ws = packer.pack_tests(nums, dur_ms)
+    if not ws:
+        return 0.0
+    return (max(sum(dur_ms[n] for n in w) for w in ws) + 2000 * len(ws)) / 1000.0
+
+
+def _est_test_cpu_sec(nodeid: str, rec_sec: float, seen_mods: set[str]) -> float:
+    """Estimate actual single-threaded in-container CPU seconds for running one test."""
+    mod_file = nodeid.split("::", 1)[0]
+    if mod_file == "tests/test_optimizer.py":
+        # Some optimizer tests run multi-core in tests.json, others single-threaded
+        base = rec_sec * 1.45 + 0.015
+        setup = 0.18 if mod_file not in seen_mods else 0.0
+    elif mod_file == "tests/test_executor.py":
+        base = rec_sec * 1.15 + 0.01
+        setup = 0.25 if mod_file not in seen_mods else 0.0
+    else:
+        base = rec_sec * 1.05 + 0.005
+        setup = 0.04 if mod_file not in seen_mods else 0.0
+    return base + setup
+
+
+def _can_shadow_instrument(
+    patched_py: dict[str, tuple[bytes | None, bytes | None]],
+    patched_nonpy: dict[str, bytes | None],
+) -> bool:
+    """Quick AST check whether this commit qualifies for shadow expression instrumentation."""
+    if len(patched_py) != 1 or patched_nonpy:
+        return False
+    rel, (old_b, new_b) = next(iter(patched_py.items()))
+    if old_b is None or new_b is None:
+        return False
+    try:
+        old_tree = ast.parse(old_b, filename=rel)
+        new_tree = ast.parse(new_b, filename=rel)
+        return _find_single_expr_diff(old_tree, new_tree) is not None
+    except Exception:
+        return False
+
+
+def _economic_plan(
+    candidates: list[tuple[int, str, float]],
+    can_shadow: bool,
+    cfg: dict[str, Any],
+) -> tuple[bool, list[tuple[int, str, float]]]:
+    """Economic gate & saving-per-CPU ordering before forking.
+
+    Returns `(should_verify, ordered_candidates_to_pass_to_child)`.
+    """
+    if not candidates:
+        return False, []
+
+    static_cost = _pack_cost_sec(candidates)
+    if static_cost <= float(cfg["min_static_cost_to_verify"]):
+        return False, []
+
+    # Filter out subprocess-only test that cannot be verified in-memory
+    verifiable = [c for c in candidates if not c[1].endswith("::test_lazy_load")]
+    if not verifiable:
+        return False, []
+
+    max_single = float(cfg["max_single_test_sec"])
+    last_test_max = float(cfg["last_test_max_sec"])
+    fork_ovh = float(cfg["fork_overhead_sec"])
+    min_roi = float(cfg["min_roi_ratio"])
+    sh_min_p = int(cfg["shadow_min_passed"])
+    sh_stop_p = int(cfg["shadow_early_stop_passed"])
+    lap_min_p = int(cfg["laplace_min_passed"])
+    lap_alpha = float(cfg["laplace_alpha"])
+
+    # Determine which tests are runnable under single-test caps
+    by_dur = sorted(verifiable, key=lambda x: (x[2], x[0]))
+    runnable: list[tuple[int, str, float]] = []
+    unrunnable: list[tuple[int, str, float]] = [c for c in candidates if c[1].endswith("::test_lazy_load")]
+
+    for idx, c in enumerate(by_dur):
+        is_last = (idx == len(by_dur) - 1) and (len(unrunnable) == 0)
+        cap = last_test_max if is_last else max_single
+        if c[2] <= cap:
+            runnable.append(c)
+        else:
+            unrunnable.append(c)
+
+    if not runnable:
+        return False, []
+
+    # Estimate best-case remaining set & CPU cost
+    if not unrunnable:
+        # Case A: ALL tests in S are runnable -> passing all eliminates entire static_cost!
+        seen_m: set[str] = set()
+        est_cpu = fork_ovh
+        for _, nid, d in runnable:
+            est_cpu += _est_test_cpu_sec(nid, d, seen_m)
+            seen_m.add(nid.split("::", 1)[0])
+        max_saving = static_cost
+        can_eliminate_all = True
+    elif can_shadow and len(runnable) >= sh_min_p:
+        # Case B: Shadow-instrumentable canary proof can eliminate entire static_cost!
+        canary_slice = runnable[: min(len(runnable), sh_stop_p)]
+        seen_m = set()
+        est_cpu = fork_ovh
+        for _, nid, d in canary_slice:
+            est_cpu += _est_test_cpu_sec(nid, d, seen_m)
+            seen_m.add(nid.split("::", 1)[0])
+        max_saving = static_cost
+        can_eliminate_all = True
+    elif len(runnable) >= lap_min_p:
+        # Case C: Enough runnable canaries for conservative Laplace pruning of >15s monsters
+        m_est = min(len(runnable), int(cfg["max_canary_tests"]))
+        p_post = lap_alpha / (m_est + lap_alpha)
+        kept_after = [c for c in unrunnable if p_post * 300.0 > c[2]]
+        max_saving = static_cost - _pack_cost_sec(kept_after)
+        seen_m = set()
+        est_cpu = fork_ovh
+        for _, nid, d in runnable[:m_est]:
+            est_cpu += _est_test_cpu_sec(nid, d, seen_m)
+            seen_m.add(nid.split("::", 1)[0])
+        can_eliminate_all = len(kept_after) == 0
+    else:
+        # Case D: Unrunnable tests WILL remain; only marginal drop in pack_cost is achievable
+        max_saving = static_cost - _pack_cost_sec(unrunnable)
+        seen_m = set()
+        est_cpu = fork_ovh
+        for _, nid, d in runnable:
+            est_cpu += _est_test_cpu_sec(nid, d, seen_m)
+            seen_m.add(nid.split("::", 1)[0])
+        can_eliminate_all = False
+
+    # Commit-level economic gate: verify only if max_possible_saving > est_cpu * min_roi
+    if max_saving <= est_cpu * min_roi:
+        return False, []
+
+    # Per-candidate greedy ordering by saving per CPU second (accounting for module reuse!)
+    # and per-candidate economic gate in Case D.
+    use_exact_marginal = len(candidates) <= 40
+    is_canary_mode = bool(unrunnable) and can_eliminate_all
+    worker_share = (2.0 / len(runnable)) if can_eliminate_all else 0.0
+
+    # Precompute direct marginal saving for each runnable candidate once
+    direct_sav_map: dict[int, float] = {}
+    for c in runnable:
+        n, _, d = c
+        if use_exact_marginal:
+            rem = [x for x in candidates if x[0] != n]
+            direct_sav_map[n] = static_cost - _pack_cost_sec(rem)
+        else:
+            direct_sav_map[n] = d
+
+    # Greedy selection by highest saving per CPU second (with module-load amortization),
+    # keeping any last-test-rescue candidate (d > max_single) at the end.
+    regular = [c for c in runnable if c[2] <= max_single]
+    rescue = [c for c in runnable if c[2] > max_single]
+
+    ordered_runnable: list[tuple[int, str, float]] = []
+    seen_probe: set[str] = set()
+    pool = list(regular)
+    while pool:
+        best_idx = -1
+        best_key: tuple[float, float, int] | None = None
+        for idx_p, c in enumerate(pool):
+            n, nid, d = c
+            c_cpu = _est_test_cpu_sec(nid, d, seen_probe)
+            dsav = direct_sav_map[n]
+            if (not can_eliminate_all) and (dsav <= c_cpu):
+                continue
+            if is_canary_mode:
+                # In canary mode every passing test contributes equally to the shadow/Laplace
+                # proof that eliminates static_cost -> saving per CPU second is proportional to 1 / c_cpu
+                roi = static_cost / max(c_cpu, 0.005)
+            else:
+                eff_sav = dsav + worker_share
+                roi = eff_sav / max(c_cpu, 0.005)
+            key = (-roi, d, n)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_idx = idx_p
+        if best_idx < 0:
+            break
+        chosen = pool.pop(best_idx)
+        ordered_runnable.append(chosen)
+        seen_probe.add(chosen[1].split("::", 1)[0])
+
+    for c in sorted(rescue, key=lambda x: (x[2], x[0])):
+        n, nid, d = c
+        c_cpu = _est_test_cpu_sec(nid, d, seen_probe)
+        if can_eliminate_all or direct_sav_map[n] > c_cpu:
+            ordered_runnable.append(c)
+
+    if not ordered_runnable:
+        return False, []
+
+    # Re-append unrunnable tests at the tail so child knows full candidate list (e.g. is_last check)
+    return True, ordered_runnable + unrunnable
 
 # Sentinel exception for instant subTest fail-fast
 class _SubTestFastFail(BaseException):
@@ -722,20 +931,14 @@ class HybridVerifier:
         if len(candidates) > int(self.cfg["max_candidates_to_verify"]):
             return orig_nums
 
-        # Sort fastest-first
-        ordered = sorted(candidates, key=lambda x: (x[2], x[0]))
-
-        # If even the single fastest test exceeds our cap, don't bother forking!
-        total_rec = sum(d for _, _, d in ordered)
-        single_cap = (
-            max(float(self.cfg["max_single_test_sec"]), 1.9)
-            if len(ordered) <= 3 and total_rec <= 2.0
-            else float(self.cfg["max_single_test_sec"])
-        )
-        if ordered[0][2] > single_cap:
+        # Economic gate + saving-per-CPU-second ordering
+        can_shadow = _can_shadow_instrument(patched_py, patched_nonpy)
+        should_verify, ordered = _economic_plan(candidates, can_shadow, self.cfg)
+        if not should_verify or not ordered:
             return orig_nums
 
         # Pre-import duckdb/pandas/numpy once in parent if any optimizer/executor test is runnable
+        single_cap = float(self.cfg["last_test_max_sec"])
         runnable_nids = [nid for _, nid, d in ordered if d <= single_cap]
         self._ensure_heavy_deps_preloaded(runnable_nids)
 

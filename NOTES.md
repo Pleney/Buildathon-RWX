@@ -187,4 +187,17 @@ Measured inside the exact scorer container (`--cpus 2 --read-only --user 65534:6
     2. `TestOptimizer` fixture tests run single-threaded under `_SyncExecutor` (so actual CPU is ~2x their multi-core recorded `tests.json` duration), making marginal pruning unprofitable unless eliminating the 2.00 s worker startup cost or probing shadow equivalence.
     3. Commits where a `fixture` file is also modified alongside code (high probability of failure, low marginal saving).
 
+### Step 2: Economic Gate & Saving-Per-CPU Ordering (`verifier.py`)
+- Added `_economic_plan` before forking:
+  - Computes exact packed cost (`max_load + 2k`) via `packer.pack_tests` and per-test estimated single-threaded CPU cost (`_est_test_cpu_sec`, accounting for `_SyncExecutor` single-threaded overhead on `test_optimizer.py` and one-time module/class setup amortization).
+  - Evaluates best-case achievable saving (`max_possible_saving`) across all-runnable, shadow-canary, Laplace-canary, and partial-runnable regimes; skips forking unless `max_possible_saving > est_cpu * min_roi_ratio` (`1.0`).
+  - Greedily orders runnable candidates by descending saving per CPU second (with module-load amortization), placing last-test-rescue candidates (`> max_single_test_sec`) at the tail and applying a per-candidate `direct_saving > est_cpu` gate when unrunnable tests will remain.
+- Tuned `min_static_cost_to_verify` across `{0.0, 2.02, 2.10, 2.25}`: any threshold `> 2.0` worsens total by `+1.65 s` to `+5.20 s` because verifying a tiny test risks `~0.18 s` CPU to save `>= 2.00 s` worker startup (~11:1 reward-to-risk). Kept `min_static_cost_to_verify = 0.0` and let the saving-vs-CPU gate decide.
+- **Scorer-limit Docker benchmark (`--cpus 2 --read-only --user 65534:65534`, 3 runs)**:
+  - Simulated: **`94.581 s`** | Misses: **`0 / 30`**
+  - Median container CPU: **`10.069 s`** (runs: `9.999 s`, `10.122 s`, `10.069 s`, down from `12.513 s`)
+  - **Total (`simulated + CPU`)**: **`104.650 s`** (**`-2.444 s`** vs `107.094 s` baseline -> **KEPT**)
+  - Money-losing CPU dropped from `3.519 s` to `2.103 s` (`-40%`).
+
+
 
