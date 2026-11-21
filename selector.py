@@ -198,12 +198,28 @@ class BlastRadiusSelector:
         self.expr_class_file: dict[str, str] = self.m["expr_class_file"]
         self.test_file_expr_refs: dict[str, list[str]] = self.m.get("test_file_expr_refs", {})
         self.base_sources: dict[str, bytes] = self.m["base_sources"]
-        self.expr_profiles: dict[str, dict[tuple[int, int], tuple[int, ...]]] = self.m.get("expr_profiles", {})
+        self.expr_profiles: dict[str, dict[tuple[int, ...], tuple[int, ...]]] = self.m.get("expr_profiles", {})
+        self.reach_profiles: dict[str, dict[tuple[int, ...], int]] = self.m.get("reach_profiles", {})
+        self.import_time_funcs: dict[str, set[str]] = {
+            k: set(v) for k, v in self.m.get("import_time_funcs", {}).items()
+        }
+
+        # Tests that spawn subprocesses or were not profiled in-process -> never drop via unreached
+        self._unprofiled_test_bits: int = 0
+        unprof_ids = set(self.m.get("unprofiled_test_ids", ()))
+        unprof_ids.add("tests/dialects/test_dialect.py::TestDialect::test_lazy_load")
+        for tid in unprof_ids:
+            try:
+                mi = map_test_ids.index(tid)
+                self._unprofiled_test_bits |= 1 << mi
+            except ValueError:
+                pass
 
         # Cache per-commit patched bytes & AST analyses to avoid duplicate ast.parse
         self._last_commit_py_overlay: dict[str, tuple[bytes | None, bytes | None]] = {}
         self._last_commit_ast_identical: set[str] = set()
-        self._last_commit_source_trees: list[tuple[str, ast.AST, ast.AST]] = []
+        # (rel, old_tree, new_tree, file_probs, scope_clean)
+        self._last_commit_source_trees: list[tuple[str, ast.AST, ast.AST, dict[int, float], bool]] = []
         self._src_cache: dict[str, bytes] = {}
         self._stmt_spans_cache: dict[str, list[tuple[int, int]]] = {}
         self._lambda_spans_cache: dict[str, list[tuple[int, int]]] = {}
@@ -589,8 +605,6 @@ class BlastRadiusSelector:
             self._last_commit_ast_identical.add(rel)
         else:
             self._last_commit_py_overlay[rel] = (old_bytes, new_bytes)
-            if not ana.syntax_error and ana.old_tree is not None and ana.new_tree is not None:
-                self._last_commit_source_trees.append((rel, ana.old_tree, ana.new_tree))
 
         # 1. Syntax error or encoding change -> all importers + dialect tests + meta
         if ana.syntax_error:
@@ -608,10 +622,28 @@ class BlastRadiusSelector:
                 self._add_prob(probs, bits if bits else self.all_map_bits, p_ident)
             return
 
-        # 3. Root __init__.py with real AST change -> select all tests
+        # 3. Root __init__.py: use function-body scoping ONLY when exclusively existing
+        #    non-import-time function bodies changed (e.g. transpile, tokenize); if any
+        #    changed function runs during module import (e.g. parse_one) or import_time_funcs
+        #    is unavailable, conservatively select all tests.
         if cat == "root_init":
-            self._add_prob(probs, self.all_map_bits, cfg["p_direct"])
-            return
+            imp_fns = self.import_time_funcs.get(rel)
+            pure_func_only = (
+                self.enable_p1_root_init
+                and bool(self.import_time_funcs)
+                and bool(ana.changed_funcs)
+                and not (imp_fns and any(fq in imp_fns for fq in ana.changed_funcs))
+                and not ana.changed_all
+                and not ana.added_or_removed_public_names
+                and not ana.changed_other_module_code
+                and not ana.changed_imports
+                and not ana.changed_class_headers
+                and not ana.changed_class_attrs
+                and not ana.changed_module_vars
+            )
+            if not pure_func_only:
+                self._add_prob(probs, self.all_map_bits, cfg["p_direct"])
+                return
 
         # 4. Package __init__.py, changed imports, __all__, added/removed public names,
         #    or arbitrary top-level executable statements -> all importers
@@ -650,10 +682,13 @@ class BlastRadiusSelector:
             self._ensure_ast_caches(rel, pre_parsed=ana.old_tree)
         new_tree = ana.new_tree
 
+        any_scope_changed = False
         for fq in ana.changed_funcs:
             ftests = file_fmap.get(fq, 0)
             span = func_spans.get(fq)
             scope_changed = self._func_scope_changed(rel, fq, new_tree)
+            if scope_changed:
+                any_scope_changed = True
 
             # Collect lines belonging to this function that were touched
             fn_changed_lines = (
@@ -846,6 +881,24 @@ class BlastRadiusSelector:
         ):
             fb = self._importer_tests(rel)
             self._add_prob(probs, fb if fb else self.all_map_bits, cfg["p_direct"])
+            return
+
+        # Record clean function-body-only source edits for build-time expression-site proving
+        expr_provable_file = (
+            ana.old_tree is not None
+            and ana.new_tree is not None
+            and bool(ana.changed_funcs)
+            and not any_scope_changed
+            and not ana.changed_class_attrs
+            and not ana.changed_module_vars
+            and not ana.changed_class_headers
+            and not ana.changed_imports
+            and not ana.changed_all
+            and not ana.added_or_removed_public_names
+            and not ana.changed_other_module_code
+        )
+        if expr_provable_file:
+            self._last_commit_source_trees.append((rel, ana.old_tree, ana.new_tree, probs, True))
 
     def _select_for_test_file(self, fp: pp.FilePatch, probs: dict[int, float]) -> None:
         cfg = self.cfg
@@ -1054,63 +1107,79 @@ class BlastRadiusSelector:
         self._last_commit_ast_identical.clear()
         self._last_commit_source_trees.clear()
 
+        per_file_probs: list[tuple[str, str, dict[int, float]]] = []
+
         for fp, cat in zip(parsed.files, categories):
             if cat == "docs":
                 continue
-            elif cat in ("config", "rust_or_c", "other"):
+            fprobs: dict[int, float] = {}
+            if cat in ("config", "rust_or_c", "other"):
                 # Specific tight case: sqlglotc/ only affects test_sqlglotc.py unless root setup/pyproject
                 if fp.path.startswith("sqlglotc/") and not fp.path.endswith(".c"):
                     bits = self.test_file_to_tests.get("tests/test_sqlglotc.py", 0)
                     if bits:
-                        self._add_prob(probs, bits, self.cfg["p_direct"])
+                        self._add_prob(fprobs, bits, self.cfg["p_direct"])
+                        per_file_probs.append((fp.base_path, cat, fprobs))
                         continue
                 force_all = True
                 break
             elif cat == "fixture":
-                self._select_for_fixture(fp, probs)
+                self._select_for_fixture(fp, fprobs)
             elif cat == "test":
-                self._select_for_test_file(fp, probs)
+                self._select_for_test_file(fp, fprobs)
             elif cat == "test_helper":
-                self._select_for_test_helper(fp, probs)
+                self._select_for_test_helper(fp, fprobs)
             elif cat in ("source", "root_init", "pkg_init"):
-                self._select_for_python_source(fp, cat, probs)
+                self._select_for_python_source(fp, cat, fprobs)
             else:
                 force_all = True
                 break
+            per_file_probs.append((fp.base_path, cat, fprobs))
 
         if force_all:
             return list(self.all_test_nums)
 
-        if not probs:
-            return []
-
-        # Build-time per-test expression-site profile pruning:
-        # Only when the ENTIRE commit modifies a single non-docs, non-AST-identical
-        # Python source file, drop test T ONLY if T's own recorded profile at the
-        # single edited expression site proves the edit cannot change T's trace.
-        if (
-            self.use_expr_profiles
-            and self.expr_profiles
-            and len(self._last_commit_source_trees) == 1
-        ):
+        # Build-time per-test expression-site & reachability profile proving:
+        # - With BLAST_P1_MULTISITE=1: prove per-file on each clean function-body source
+        #   file BEFORE taking the union across all files in the commit, so test T is
+        #   dropped ONLY IF every modified site in every modified file is unreached or
+        #   proven unchanged for T (First-Divergence Induction).
+        # - With BLAST_P1_MULTISITE=0: only prove when active_files == 1 and 1 expr diff.
+        if self.use_expr_profiles and (self.expr_profiles or self.reach_profiles) and self._last_commit_source_trees:
             active_files = sum(
                 1
                 for fp, cat in zip(parsed.files, categories)
                 if cat != "docs" and fp.base_path not in self._last_commit_ast_identical
             )
-            if active_files == 1:
-                rel_p, old_t, new_t = self._last_commit_source_trees[0]
-                file_profs = self.expr_profiles.get(rel_p)
-                if file_profs:
+            if self.enable_p1_multisite or active_files == 1:
+                for rel_p, old_t, new_t, fprobs, scope_clean in self._last_commit_source_trees:
+                    if not scope_clean or not fprobs:
+                        continue
+                    file_profs = self.expr_profiles.get(rel_p)
+                    file_reach = self.reach_profiles.get(rel_p)
+                    if not file_profs and not file_reach:
+                        continue
                     cand_bits = 0
-                    for idx in probs:
+                    for idx in fprobs:
                         cand_bits |= 1 << idx
                     proven = _expr_profiler_mod.prove_unchanged_test_bits(
-                        old_t, new_t, file_profs, cand_bits
+                        old_t,
+                        new_t,
+                        file_profs,
+                        cand_bits,
+                        file_reach_profiles=file_reach,
+                        unprofiled_test_bits=self._unprofiled_test_bits,
+                        enable_reach=self.enable_p1_reach,
+                        enable_multisite=self.enable_p1_multisite,
                     )
                     if proven:
                         for idx in _iter_set_bits(proven):
-                            probs.pop(idx, None)
+                            fprobs.pop(idx, None)
+
+        for _, _, fprobs in per_file_probs:
+            for idx, p in fprobs.items():
+                if p > probs.get(idx, 0.0):
+                    probs[idx] = p
 
         if not probs:
             return []
@@ -1218,6 +1287,8 @@ def load_map(
             for k in (
                 "expr_profiles",
                 "reach_profiles",
+                "import_time_funcs",
+                "unprofiled_test_ids",
                 "mapping_profiles",
                 "range_profiles",
                 "const_profiles",
@@ -1229,6 +1300,8 @@ def load_map(
             for k in (
                 "expr_profiles",
                 "reach_profiles",
+                "import_time_funcs",
+                "unprofiled_test_ids",
                 "mapping_profiles",
                 "range_profiles",
                 "const_profiles",

@@ -172,9 +172,10 @@ def _mine_ast_edits(
         if all(not _can_add(fam) for fam in quotas):
             break
         lmap = line_to_tests.get(rel, {})
-        profs = expr_profiles.get(rel, {})
-        if not lmap or not profs:
+        raw_profs = expr_profiles.get(rel, {})
+        if not lmap or not raw_profs:
             continue
+        profs = {(k[0], k[1]): v for k, v in raw_profs.items()}
         text = (sqlglot_root / rel).read_text("utf-8")
         try:
             tree = ast.parse(text, filename=rel)
@@ -516,8 +517,115 @@ def generate_synthetic_edits(sqlglot_root: Path, map_data: dict[str, Any]) -> li
     )
 
     # Add >= 100 programmatically mined AST single-expression edits across sqlglot/**/*.py
+    # (Mined BEFORE phase-specific stress additions so original 133 names & 20% hold-out stay invariant!)
     mined = _mine_ast_edits(sqlglot_root, map_data, existing_keys)
     edits.extend(mined)
+
+    # --- Phase 1 Quick-Set Stress Cases (multi-site feed, nested, short-circuit, __init__) ---
+    def add_multi(name: str, kind: str, rel: str, replacements: list[tuple[str, str]]) -> None:
+        text = (sqlglot_root / rel).read_text("utf-8")
+        new_text = text
+        for old_sub, new_sub in replacements:
+            assert old_sub in new_text, f"Pattern {old_sub!r} not found in {rel}"
+            new_text = new_text.replace(old_sub, new_sub, 1)
+        edits.append(
+            {
+                "name": name,
+                "kind": kind,
+                "rel": rel,
+                "patch": _make_diff(rel, text, new_text),
+                "files": {rel: new_text},
+                "quick": True,
+            }
+        )
+
+    # 14a. Multi-site where Site 1 feeds Site 2 (BOTH proven equivalent)
+    add_multi(
+        "p1_multisite_feed_safe",
+        "p1_multisite_feed",
+        "sqlglot/anonymize.py",
+        [
+            ("is_number = token.token_type == TokenType.NUMBER", "is_number = token.token_type is TokenType.NUMBER"),
+            ("if alias is None:", "if alias == None:"),
+        ],
+    )
+
+    # 14b. Multi-site where Site 1 feeds Site 2 (Site 1 BREAKS, Site 2 equivalent -> MUST KEEP!)
+    add_multi(
+        "p1_multisite_feed_trap",
+        "p1_multisite_feed",
+        "sqlglot/anonymize.py",
+        [
+            ("is_number = token.token_type == TokenType.NUMBER", "is_number = token.token_type != TokenType.NUMBER"),
+            ("if alias is None:", "if alias == None:"),
+        ],
+    )
+
+    # 14c. Multi-file commit: context.py (proven equiv) + helper.py (breaking return)
+    ctx_old = (sqlglot_root / "sqlglot/executor/context.py").read_text("utf-8")
+    ctx_new = ctx_old.replace("if self._table is None:", "if self._table == None:", 1)
+    hlp_old = (sqlglot_root / "sqlglot/helper.py").read_text("utf-8")
+    hlp_new = hlp_old.replace("    if value is None:\n        return []", "    if value is None:\n        return [None]", 1)
+    edits.append(
+        {
+            "name": "p1_multisite_two_files_trap",
+            "kind": "p1_multisite_feed",
+            "rel": "sqlglot/executor/context.py+sqlglot/helper.py",
+            "patch": _make_diff("sqlglot/executor/context.py", ctx_old, ctx_new)
+            + _make_diff("sqlglot/helper.py", hlp_old, hlp_new),
+            "files": {
+                "sqlglot/executor/context.py": ctx_new,
+                "sqlglot/helper.py": hlp_new,
+            },
+            "quick": True,
+        }
+    )
+
+    # 14d. Nested / overlapping sites in ONE expression (outer BoolOp + inner Compare -> MUST KEEP!)
+    add(
+        "p1_nested_expr_trap",
+        "p1_nested_expr",
+        "sqlglot/anonymize.py",
+        "            token.token_type == TokenType.VAR\n            and i + 1 < len(tokens)\n            and tokens[i + 1].token_type == TokenType.L_PAREN",
+        "            token.token_type == TokenType.VAR\n            or i + 1 <= len(tokens)\n            and tokens[i + 1].token_type == TokenType.L_PAREN",
+    )
+
+    # 14e. Short-circuit IfExp orelse arm mutation (athena.py L106)
+    add(
+        "p1_short_circuit_ifexp",
+        "p1_short_circuit",
+        "sqlglot/dialects/athena.py",
+        "return trino_tokens if trino_tokens is not None else self._trino_tokenizer.tokenize(sql)",
+        "return trino_tokens if trino_tokens is not None else []",
+    )
+
+    # 14f. Short-circuit BoolOp 3rd operand mutation (anonymize.py L80)
+    add(
+        "p1_short_circuit_and_rhs",
+        "p1_short_circuit",
+        "sqlglot/anonymize.py",
+        "and tokens[i + 1].token_type == TokenType.L_PAREN",
+        "and tokens[i + 1].token_type != TokenType.L_PAREN",
+    )
+
+    # 14g. sqlglot/__init__.py function-body edit inside transpile() (IfExp.orelse)
+    add(
+        "p1_root_init_func_transpile",
+        "p1_root_init",
+        "sqlglot/__init__.py",
+        'write.generate(expression, copy=False, **opts) if expression else ""',
+        'write.generate(expression, copy=False, **opts) if expression else "DEAD"',
+    )
+
+    # 14h. sqlglot/__init__.py function-body edit (breaking inside parse_one -> MUST KEEP callers!)
+    add(
+        "p1_root_init_func_break",
+        "p1_root_init",
+        "sqlglot/__init__.py",
+        "if not result or result[0] is None:",
+        "if not result or result[0] is not None:",
+    )
+
     return edits
 
 
@@ -671,8 +779,14 @@ def run_pytest_on_tests(
             chunk_fail: set[str] = set()
             for line in output.splitlines():
                 s = line.strip()
+                # Skip passing / subpassed lines (subTest msgs may contain SQL like "ERROR ON ERROR"!)
+                if s.startswith(("PASSED ", "SUBPASSED")) or " PASSED" in s or " SUBPASSED" in s:
+                    continue
                 if s.startswith(("FAILED ", "ERROR ", "SUBFAILED")) or (
-                    " FAILED" in s or " ERROR" in s or " SUBFAILED" in s
+                    s.endswith((" FAILED", " ERROR", " SUBFAILED"))
+                    or " FAILED [" in s
+                    or " ERROR [" in s
+                    or " SUBFAILED [" in s
                 ):
                     for nid in chunk_set:
                         if nid in s:
