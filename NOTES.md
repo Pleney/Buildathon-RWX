@@ -110,5 +110,17 @@
 | Misses | **0 / 30** |
 | Local wall time | **0.643 s** |
 
+---
+
+## Phase 5: Optimal Worker Packer (`packer.py`)
+
+- Exact integer millisecond objective: `max(worker_load_ms) + 2000 * k` for `k` in `1..8`.
+- Theoretical lower-bound pruning skips impossible `k` values (`max(max_single, ceil(total/k)) + 2000*k >= best_cost`).
+- LPT initialization + bounded move and 1-1 swap local search between busiest and lighter workers.
+- Verified:
+  - Classic LPT-suboptimal `[5000, 4000, 3000, 3000, 3000]` -> optimal `[9000, 9000]` (k=2).
+  - Full 1,620-test suite -> optimal `k=4`, `max_load=28.817s` (equals single longest test), cost `36.817s` (vs starter's `40.349s`), packed in **1.95 ms**.
+
+
 
 
