@@ -50,6 +50,11 @@ class _SyncExecutor:
         **kwargs: Any,
     ) -> None:
         if initializer is not None:
+            # Mirror ProcessPoolExecutor pickling of initargs across spawn boundary
+            try:
+                initargs = pickle.loads(pickle.dumps(initargs))
+            except Exception:
+                pass
             initializer(*initargs)
 
     def __enter__(self) -> "_SyncExecutor":
@@ -61,7 +66,11 @@ class _SyncExecutor:
     def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> concurrent.futures.Future:
         fut: concurrent.futures.Future = concurrent.futures.Future()
         try:
-            fut.set_result(fn(*args, **kwargs))
+            # Mirror ProcessPoolExecutor IPC serialization so __reduce__/serde paths are traced
+            fn_p, args_p, kwargs_p = pickle.loads(pickle.dumps((fn, args, kwargs)))
+            res = fn_p(*args_p, **kwargs_p)
+            res = pickle.loads(pickle.dumps(res))
+            fut.set_result(res)
         except BaseException as exc:
             fut.set_exception(exc)
         return fut
@@ -645,40 +654,73 @@ def build_static_maps(sqlglot_dir: Path) -> dict[str, Any]:
                 stack.extend(direct_imports.get(cur, ()))
         test_file_deps[rel] = sorted(m for m in visited if m.startswith("sqlglot"))
 
-    # Class hierarchy across sqlglot/
-    class_defs_by_short: dict[str, list[str]] = defaultdict(list)
-    for rel, info in ast_index.items():
-        if not rel.startswith("sqlglot/"):
-            continue
-        for _, _, qname, _ in info["classes"]:
-            short = qname.split(".")[-1]
-            class_defs_by_short[short].append(f"{rel}:{qname}")
+    # Exact runtime class hierarchy across sqlglot/ via real Python MRO
+    import importlib
+    import pkgutil
 
-    direct_subclasses: dict[str, set[str]] = defaultdict(set)
+    sys.path.insert(0, str(sqlglot_dir.resolve()))
+    import sqlglot as _sg
+
+    repo_prefix = str(sqlglot_dir.resolve()) + os.sep
+    all_classes: set[type] = set()
+
+    def _collect_classes_from_obj(obj: Any) -> None:
+        if isinstance(obj, type):
+            if obj in all_classes:
+                return
+            all_classes.add(obj)
+            for v in obj.__dict__.values():
+                if isinstance(v, type):
+                    _collect_classes_from_obj(v)
+
+    # Walk all modules under sqlglot package
+    for mod_info in pkgutil.walk_packages(_sg.__path__, prefix="sqlglot."):
+        if mod_info.name == "sqlglot.__main__":
+            continue
+        try:
+            m = importlib.import_module(mod_info.name)
+        except Exception:
+            continue
+        for v in vars(m).values():
+            if isinstance(v, type):
+                _collect_classes_from_obj(v)
+    for v in vars(_sg).values():
+        if isinstance(v, type):
+            _collect_classes_from_obj(v)
+
+    def _cls_id(c: type) -> str | None:
+        mod = sys.modules.get(c.__module__)
+        fname = getattr(mod, "__file__", None) if mod is not None else None
+        if not fname:
+            return None
+        abs_p = os.path.abspath(fname)
+        if not abs_p.startswith(repo_prefix):
+            return None
+        rel = abs_p[len(repo_prefix) :].replace("\\", "/")
+        return f"{rel}:{c.__qualname__}"
+
+    class_subclasses_sets: dict[str, set[str]] = defaultdict(set)
     expr_class_file: dict[str, str] = {}
     for rel, info in ast_index.items():
-        if not rel.startswith("sqlglot/"):
-            continue
-        for _, _, qname, bases in info["classes"]:
-            full_id = f"{rel}:{qname}"
-            if rel.startswith("sqlglot/expressions/") and "." not in qname:
-                expr_class_file[qname] = rel
-            for b in bases:
-                b_short = b.split(".")[-1]
-                for target_id in class_defs_by_short.get(b_short, ()):
-                    if target_id != full_id:
-                        direct_subclasses[target_id].add(full_id)
+        if rel.startswith("sqlglot/expressions/"):
+            for _, _, qname, _ in info["classes"]:
+                if "." not in qname:
+                    expr_class_file[qname] = rel
 
-    class_subclasses: dict[str, list[str]] = {}
-    for cls_id in list(direct_subclasses.keys()):
-        visited = set()
-        stack = list(direct_subclasses[cls_id])
-        while stack:
-            cur = stack.pop()
-            if cur not in visited:
-                visited.add(cur)
-                stack.extend(direct_subclasses.get(cur, ()))
-        class_subclasses[cls_id] = sorted(visited)
+    for c in all_classes:
+        cid = _cls_id(c)
+        if cid is None:
+            continue
+        for base in c.__mro__[1:]:
+            if base is object:
+                continue
+            bid = _cls_id(base)
+            if bid is not None and bid != cid:
+                class_subclasses_sets[bid].add(cid)
+
+    class_subclasses: dict[str, list[str]] = {
+        k: sorted(v) for k, v in class_subclasses_sets.items()
+    }
 
     # Static fixture references: match all actual files under tests/fixtures/
     all_fixture_files: list[str] = []

@@ -84,4 +84,31 @@
   - Extracts changed functions/methods, class headers (bases/decorators), class attributes (with exact changed dict keys when a class dict literal is modified), module-level variables (with dict keys), imports, `__all__`, and added/removed public names.
 - Verified on all 30 sample patches: 30/30 parsed and applied cleanly with zero errors.
 
+---
+
+## Phase 4: Selector (`selector.py`) & Map Refinements
+
+### Map Refinements Discovered During Phase 4 Testing
+1. **IPC pickling inside `_SyncExecutor`**: Initially `sqlglot/serde.py` missed `ProcessPoolExecutor` tests (`test_optimizer.py` / `test_executor.py`) because `_SyncExecutor` bypassed pickling (which calls `Expression.__reduce__` -> `serde.dump`/`load`). Adding `pickle.loads(pickle.dumps(...))` round-tripping in `_SyncExecutor.submit` restored exact `ProcessPoolExecutor` coverage: `3utz` (`serde.py`) went from a miss to 37/37 exact precision & recall.
+2. **Runtime MRO `class_subclasses`**: Replaced short-name AST class matching (which merged unrelated nested `Tokenizer` classes across dialects) with exact runtime `cls.__mro__` walking across all `sqlglot.*` modules.
+
+### Selection Architecture (`selector.py`)
+- Pure Python stdlib (`python -S -E` compatible), loads `map.pkl.gz` once.
+- Tiered probability model (`DEFAULT_CONFIG`) combining:
+  - Direct changed lines (`line_to_tests`) & enclosing multi-line statements (`p_direct`, `p_enclosing_stmt`).
+  - Enclosing functions (`func_to_tests`, promoted when changed line has zero direct coverage).
+  - Class attributes & declarative tables: direct line hits (for lambdas), `Expr` hierarchy closure (`expr_to_tests`), dialect/MRO intersection with attribute readers (`dialect_to_tests & name_ref_tests`) plus cost-bounded dialect fallback.
+  - Direct fixture reads (`fixture_to_tests`) with directory/all-fixture fallback for unmapped fixtures.
+  - Surgical test-file & test-helper selection when only specific test methods/helpers change; full file + importers otherwise.
+  - Conservative widening on syntax/encoding errors, `__all__`, public name add/remove, imports, class headers, config, Rust/C, root `__init__.py`, malformed/unknown files, and any internal exception.
+  - Cost-aware inclusion (FR4): include test `t` when `P(fail) * 300 > runtime / k_div`.
+
+### Phase 4 Sample Evaluation (Default Un-Tuned Thresholds)
+| Metric | Value |
+|---|---|
+| Simulated time (30 samples) | **188.958 s** (down from 1210.470 s baseline, **6.4x reduction**) |
+| Misses | **0 / 30** |
+| Local wall time | **0.643 s** |
+
+
 
