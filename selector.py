@@ -615,16 +615,33 @@ class BlastRadiusSelector:
 
         # Binary, deleted, or renamed source file -> wide importer selection
         if fp.is_binary or fp.is_deleted or fp.is_rename:
-            bits = self._importer_tests(rel) | self._dialect_meta_bits
-            self._add_prob(probs, bits if bits else self.all_map_bits, cfg["p_direct"])
+            imp = self._importer_tests(rel)
+            if imp:
+                bits = imp | self._dialect_meta_bits | self._docs_test_bits
+                if rel.startswith("sqlglot/typing/"):
+                    bits |= self.test_file_to_tests.get("tests/test_typing.py", 0)
+            else:
+                bits = self.all_map_bits
+            self._add_prob(probs, bits, cfg["p_direct"])
+            if self._docs_runtime_nums:
+                self._last_commit_extra_nums.update(self._docs_runtime_nums)
             return
 
-        # New file in sqlglot/ -> importers of its package __init__.py + meta tests
+        # New file in sqlglot/ -> importers of its package __init__.py + meta/docs tests
+        # (falls back to all tests if the package __init__.py itself is new/unmapped!)
         if fp.is_new or rel not in self.base_sources:
             pkg_dir = rel.rsplit("/", 1)[0] if "/" in rel else ""
             pkg_init = f"{pkg_dir}/__init__.py" if pkg_dir else "sqlglot/__init__.py"
-            bits = self._importer_tests(pkg_init) | self._dialect_meta_bits
-            self._add_prob(probs, bits if bits else self.all_map_bits, cfg["p_direct"])
+            imp = self._importer_tests(pkg_init)
+            if imp:
+                bits = imp | self._dialect_meta_bits | self._docs_test_bits
+                if rel.startswith("sqlglot/typing/"):
+                    bits |= self.test_file_to_tests.get("tests/test_typing.py", 0)
+            else:
+                bits = self.all_map_bits
+            self._add_prob(probs, bits, cfg["p_direct"])
+            if self._docs_runtime_nums:
+                self._last_commit_extra_nums.update(self._docs_runtime_nums)
             return
 
         # Root sqlglot/__init__.py -> broad (unless proven AST-identical)
@@ -1096,6 +1113,7 @@ class BlastRadiusSelector:
 
         # If ONLY specific test_* methods changed (no helpers, setUp, imports, or module vars),
         # select just those exact test methods + any importers of the test file.
+        # Guard against intra-file inheritance (editing a method on a base class in the same file).
         if (
             ana.changed_funcs
             and not ana.changed_class_attrs
@@ -1106,10 +1124,23 @@ class BlastRadiusSelector:
             and not ana.changed_other_module_code
             and not ana.added_or_removed_public_names
         ):
+            subclassed_in_file: set[str] = set()
+            if ana.old_tree is not None and isinstance(ana.old_tree, ast.Module):
+                cls_in_file = {n.name for n in ana.old_tree.body if isinstance(n, ast.ClassDef)}
+                for n in ana.old_tree.body:
+                    if isinstance(n, ast.ClassDef):
+                        for b in n.bases:
+                            bn = b.id if isinstance(b, ast.Name) else (b.attr if isinstance(b, ast.Attribute) else "")
+                            if bn in cls_in_file:
+                                subclassed_in_file.add(bn)
             mbits = self._test_method_bits.get(rel, {})
             targeted = 0
             all_matched = True
             for fq in ana.changed_funcs:
+                owner_cls = fq.split(".", 1)[0] if "." in fq else ""
+                if owner_cls and owner_cls in subclassed_in_file:
+                    all_matched = False
+                    break
                 if fq in mbits:
                     targeted |= mbits[fq]
                 else:
@@ -1169,15 +1200,16 @@ class BlastRadiusSelector:
 
     def _select_for_fixture(self, fp: pp.FilePatch, probs: dict[int, float]) -> None:
         cfg = self.cfg
-        rel = fp.base_path
-        bits = self.fixture_to_tests.get(rel, 0)
-        if bits:
-            self._add_prob(probs, bits, cfg["p_direct"])
-            return
-        # Unmapped or newly added fixture -> all tests loading from same subdir, else all fixture tests
-        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
-        bits = self._fixture_dir_tests.get(parent, 0) or self._all_fixture_tests or self.all_map_bits
-        self._add_prob(probs, bits, cfg["p_direct"])
+        paths = [p for p in (fp.old_path, fp.new_path) if p] or [fp.base_path]
+        bits = 0
+        for rel in paths:
+            b = self.fixture_to_tests.get(rel, 0)
+            if b:
+                bits |= b
+            else:
+                parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+                bits |= self._fixture_dir_tests.get(parent, 0) or self._all_fixture_tests or self.all_map_bits
+        self._add_prob(probs, bits if bits else self.all_map_bits, cfg["p_direct"])
 
     def _build_overlay_for_verifier(
         self,
@@ -1262,8 +1294,37 @@ class BlastRadiusSelector:
         if parsed.parse_error or not parsed.files:
             return list(self.all_test_nums)
 
+        # Build work items: for any rename (including cross-category renames such as
+        # sqlglot/foo.py -> docs/foo.md or tests/fixtures/a.json -> docs/a.json),
+        # classify and evaluate BOTH the removed old_path AND the added new_path so
+        # a rename into docs/ or sqlglotc/ can never hide a deleted source/test/fixture.
+        work_items: list[tuple[pp.FilePatch, str]] = []
+        for fp in parsed.files:
+            is_ren = fp.is_rename or bool(fp.old_path and fp.new_path and fp.old_path != fp.new_path)
+            if is_ren:
+                if fp.old_path:
+                    old_fp = pp.FilePatch(
+                        old_path=fp.old_path,
+                        new_path=None,
+                        is_binary=fp.is_binary,
+                        is_deleted=True,
+                        is_rename=True,
+                    )
+                    work_items.append((old_fp, pp.classify_file(fp.old_path)))
+                if fp.new_path:
+                    new_fp = pp.FilePatch(
+                        old_path=None,
+                        new_path=fp.new_path,
+                        is_binary=fp.is_binary,
+                        is_new=True,
+                        is_rename=True,
+                    )
+                    work_items.append((new_fp, pp.classify_file(fp.new_path)))
+            else:
+                work_items.append((fp, pp.classify_file(fp.path)))
+
         # Docs-only commit -> run nothing!
-        categories = [pp.classify_file(fp.path) for fp in parsed.files]
+        categories = [cat for _, cat in work_items]
         if all(c == "docs" for c in categories):
             return []
 
@@ -1275,14 +1336,23 @@ class BlastRadiusSelector:
         self._last_commit_extra_nums.clear()
 
         per_file_probs: list[tuple[str, str, dict[int, float]]] = []
+        _SAFE_SQLGLOTC_FILES = ("sqlglotc/setup.py", "sqlglotc/pyproject.toml", "sqlglotc/MANIFEST.in")
 
-        for fp, cat in zip(parsed.files, categories):
+        for fp, cat in work_items:
             if cat == "docs":
                 continue
             fprobs: dict[int, float] = {}
             if cat in ("config", "rust_or_c", "other"):
-                # Specific tight case: sqlglotc/ only affects test_sqlglotc.py unless root setup/pyproject
-                if fp.path.startswith("sqlglotc/") and not fp.path.endswith(".c"):
+                # Narrow sqlglotc/ ONLY for in-place text edits to the 3 verified packaging
+                # files (only tests/test_sqlglotc.py reads sqlglotc/setup.py; verified 0/1617
+                # failures elsewhere). Any rename, deletion, binary, C/ext, or new file
+                # under sqlglotc/ falls through to conservative full selection.
+                if (
+                    not fp.is_rename
+                    and not fp.is_deleted
+                    and not fp.is_binary
+                    and fp.path in _SAFE_SQLGLOTC_FILES
+                ):
                     bits = self.test_file_to_tests.get("tests/test_sqlglotc.py", 0)
                     if bits:
                         self._add_prob(fprobs, bits, self.cfg["p_direct"])
@@ -1315,7 +1385,7 @@ class BlastRadiusSelector:
         if self.use_expr_profiles and (self.expr_profiles or self.reach_profiles) and self._last_commit_source_trees:
             active_files = sum(
                 1
-                for fp, cat in zip(parsed.files, categories)
+                for fp, cat in work_items
                 if cat != "docs" and fp.base_path not in self._last_commit_ast_identical
             )
             if self.enable_p1_multisite or active_files == 1:
@@ -1391,7 +1461,7 @@ class BlastRadiusSelector:
                     should_try = False
             if should_try:
                 patched_py, patched_nonpy, is_fixture_only, ok = self._build_overlay_for_verifier(
-                    parsed, categories
+                    parsed, [pp.classify_file(fp.path) for fp in parsed.files]
                 )
                 if ok and (patched_py or patched_nonpy):
                     cands = [

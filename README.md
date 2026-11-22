@@ -33,7 +33,7 @@ selecting the tests that could be affected by each patch and packing them onto 1
 | `packer.py` | Exact integer-millisecond worker packer choosing `k` in `1..8` via lower-bound pruning, LPT initialization, and move/1-1 swap local search. |
 | `gate.sh` / `gate_runner.py` | Automated 6-check release gate: no-cache Docker build (< 6 min), exact scorer sample run x3 (0 misses, CPU < 2 s, deterministic, verifier off), robustness suite, `diff_test.py --quick` (0 wrong drops on real pytest), 1.5x batch determinism (< 60 s), and repo size / zero-leak audit. |
 | `diff_test.py` | Synthetic differential test suite (65-edit `--quick` gate + full suite + deterministic 20% `--split holdout\|dev`) verifying every dropped test against real `pytest` (`SKIP_INTEGRATION=0`, pytest 9 subtests), requiring 0 wrong drops. |
-| `tests/test_robustness.py` | Standalone synthetic patch robustness suite (20 tests under `python -S -E` covering all file classes, Phase 3 equivalence rules, and adversarial traps). |
+| `tests/test_robustness.py` | Standalone synthetic patch robustness suite (24 tests under `python -S -E` covering all file classes, Phase 3 equivalence rules, cross-category renames, hunk-boundary/CRLF/tab/mode/EOF edge cases, `sqlglotc/` whitelist, dotfiles, and adversarial traps). |
 | `Dockerfile` | Slim runtime image on the pinned `python:3.13-slim` digest with only `/app` stdlib Python modules, `map.pkl.gz`, `profiles.pkl.gz`, and precompiled `.pyc` readable by `nobody` (`CMD ["python", "-S", "-E", "/app/selector.py"]`). |
 
 ## Runtime Feature Toggles (Zero-Revert Ablation)

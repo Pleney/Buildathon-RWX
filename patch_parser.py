@@ -83,15 +83,27 @@ def _clean_diff_path(raw: str) -> str | None:
     return s
 
 
+def _split_lf_lines(text: str) -> list[str]:
+    """Split text strictly on LF/CRLF (never on embedded \\f, \\v, \\x85, \\u2028, \\u2029)."""
+    if not text:
+        return []
+    parts = text.split("\n")
+    if parts and parts[-1] == "":
+        parts.pop()
+    return [p[:-1] if p.endswith("\r") else p for p in parts]
+
+
 def parse_unified_diff(text: str) -> ParsedPatch:
     """Parse a git unified diff into FilePatch objects with exact old-file changed lines."""
     if not text or not text.strip():
         return ParsedPatch(files=[], is_empty=True)
 
-    lines = text.splitlines()
+    lines = _split_lf_lines(text)
     files: list[FilePatch] = []
     cur_file: FilePatch | None = None
     cur_hunk: Hunk | None = None
+    old_rem = 0
+    new_rem = 0
     saw_any_diff_header = False
 
     i = 0
@@ -99,10 +111,51 @@ def parse_unified_diff(text: str) -> ParsedPatch:
     while i < n:
         line = lines[i]
 
+        # While strictly inside an active hunk (remaining old/new lines > 0), consume
+        # hunk body lines BEFORE checking for `diff --git ` or `--- ` file headers, so
+        # a deleted `-- comment` (`--- comment`) + added `++ ...` (`+++ ...`) or a
+        # docstring line can never split a hunk into a bogus file header.
+        if cur_hunk is not None and (old_rem > 0 or new_rem > 0):
+            if line.startswith("\\"):
+                cur_hunk.lines.append(line)
+                i += 1
+                continue
+            if line.startswith(" ") and old_rem > 0 and new_rem > 0:
+                cur_hunk.lines.append(line)
+                old_rem -= 1
+                new_rem -= 1
+                i += 1
+                continue
+            if line.startswith("-") and old_rem > 0:
+                cur_hunk.lines.append(line)
+                old_rem -= 1
+                i += 1
+                continue
+            if line.startswith("+") and new_rem > 0:
+                cur_hunk.lines.append(line)
+                new_rem -= 1
+                i += 1
+                continue
+            if line == "" and old_rem > 0 and new_rem > 0:
+                # Some diffs drop the leading space on blank context lines
+                cur_hunk.lines.append(" ")
+                old_rem -= 1
+                new_rem -= 1
+                i += 1
+                continue
+
+        # Trailing "\ No newline at end of file" immediately after a completed hunk
+        if cur_hunk is not None and old_rem == 0 and new_rem == 0 and line.startswith("\\"):
+            cur_hunk.lines.append(line)
+            i += 1
+            continue
+
         # Start of a new git file section
         if line.startswith("diff --git "):
             saw_any_diff_header = True
             cur_hunk = None
+            old_rem = 0
+            new_rem = 0
             m = _DIFF_GIT_RE.match(line)
             old_p = (m.group(1) or m.group(2)) if m else None
             new_p = (m.group(3) or m.group(4)) if m else None
@@ -116,6 +169,8 @@ def parse_unified_diff(text: str) -> ParsedPatch:
             if i + 1 < n and lines[i + 1].startswith("+++ "):
                 saw_any_diff_header = True
                 cur_hunk = None
+                old_rem = 0
+                new_rem = 0
                 old_p = _clean_diff_path(line[4:])
                 new_p = _clean_diff_path(lines[i + 1][4:])
                 cur_file = FilePatch(
@@ -151,6 +206,15 @@ def parse_unified_diff(text: str) -> ParsedPatch:
             if line.startswith("rename to "):
                 cur_file.is_rename = True
                 cur_file.new_path = _clean_diff_path(line[len("rename to ") :])
+                i += 1
+                continue
+            if line.startswith("copy from "):
+                cur_file.is_new = True
+                i += 1
+                continue
+            if line.startswith("copy to "):
+                cur_file.is_new = True
+                cur_file.new_path = _clean_diff_path(line[len("copy to ") :])
                 i += 1
                 continue
             if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
@@ -195,23 +259,25 @@ def parse_unified_diff(text: str) -> ParsedPatch:
                 lines=[],
             )
             cur_file.hunks.append(cur_hunk)
+            old_rem = old_count
+            new_rem = new_count
             i += 1
             continue
 
-        # Inside a hunk
+        # Fallback for hand-crafted hunks whose declared counts were slightly short
         if cur_hunk is not None:
             if line.startswith((" ", "-", "+", "\\")):
                 cur_hunk.lines.append(line)
                 i += 1
                 continue
             elif line == "":
-                # Some diffs drop the leading space on blank context lines
                 cur_hunk.lines.append(" ")
                 i += 1
                 continue
             else:
-                # End of hunk (e.g., trailing git signature `-- `)
                 cur_hunk = None
+                old_rem = 0
+                new_rem = 0
                 i += 1
                 continue
 
@@ -300,7 +366,7 @@ def apply_hunks(base_bytes: bytes, hunks: list[Hunk]) -> bytes | None:
             return None
 
     had_trailing_nl = base_text.endswith("\n")
-    old_lines = base_text.splitlines()
+    old_lines = _split_lf_lines(base_text)
     new_lines: list[str] = []
     cursor = 0  # 0-based index into old_lines
     new_trailing_nl = had_trailing_nl
@@ -330,6 +396,9 @@ def apply_hunks(base_bytes: bytes, hunks: list[Hunk]) -> bytes | None:
             elif tag == "-":
                 if cursor >= len(old_lines) or old_lines[cursor] != content:
                     return None
+                if j + 1 < hn and h.lines[j + 1].startswith("\\"):
+                    # Old EOF lacked newline; assume replacement adds one unless marked with "\"
+                    new_trailing_nl = True
                 cursor += 1
             elif tag == "+":
                 new_lines.append(content)
@@ -360,8 +429,6 @@ _DOC_FILENAMES = {
     "README.md",
     "AGENTS.md",
     "CLAUDE.md",
-    ".gitignore",
-    ".gitpod.yml",
 }
 _CONFIG_FILENAMES = {
     "pyproject.toml",
@@ -381,7 +448,10 @@ _RUST_OR_C_EXTENSIONS = (".rs", ".c", ".h", ".cc", ".cpp", ".pyx", ".pxd")
 
 def classify_file(rel_path: str) -> str:
     """Classify a repo-relative path into a principled category."""
-    p = rel_path.lstrip("./")
+    p = rel_path
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.lstrip("/")
     if not p:
         return "other"
 
@@ -391,6 +461,10 @@ def classify_file(rel_path: str) -> str:
     # 1. Fixtures
     if p.startswith("tests/fixtures/"):
         return "fixture"
+
+    # 1b. Integration test submodule / directory -> conservative full selection
+    if p.startswith("sqlglot-integration-tests/"):
+        return "other"
 
     # 2. Config / build / conftest / sqlglotc / CI
     if name in _CONFIG_FILENAMES or name.startswith("requirements"):
@@ -414,7 +488,7 @@ def classify_file(rel_path: str) -> str:
             return "test"
         if name.endswith(".py"):
             return "test_helper"
-        return "fixture"
+        return "other"
 
     # 5. sqlglot Python source & __init__.py
     if p.startswith("sqlglot/"):
