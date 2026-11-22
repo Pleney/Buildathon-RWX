@@ -1076,6 +1076,12 @@ def build_map(
         else:
             expr_profiles[rel][(ln, col)] = (acc[1], acc[2], acc[3])
 
+    # Run 2x fresh import/collection-time line/expr/dict probe & bake PEP 562 lazy importers
+    imp_data = _run_import_probe_2x(sqlglot_dir)
+    baked_importers = _bake_lazy_importers(
+        static["module_importers"], static["module_to_file"], static["base_sources"]
+    )
+
     # Build final compact map dict
     final_map = {
         "version": 2,
@@ -1093,14 +1099,17 @@ def build_map(
         "test_file_to_tests": dict(test_file_to_tests),
         "file_to_module": static["file_to_module"],
         "module_to_file": static["module_to_file"],
-        "module_importers": static["module_importers"],
+        "module_importers": baked_importers,
+        "lazy_importers_baked": True,
         "test_file_deps": static["test_file_deps"],
         "ast_index": clean_ast_index,
         "class_subclasses": static["class_subclasses"],
         "expr_class_file": static["expr_class_file"],
         "test_file_expr_refs": static["test_file_expr_refs"],
         "base_sources": static["base_sources"],
-        "expr_profiles": {k: dict(v) for k, v in expr_profiles.items()},
+        "import_time_func_lines": imp_data["import_time_func_lines"],
+        "import_time_exprs": imp_data["import_time_exprs"],
+        "import_time_dict_keys": imp_data["import_time_dict_keys"],
     }
 
     raw_pkl = pickle.dumps(final_map, protocol=4)
@@ -1131,6 +1140,387 @@ def build_map(
     )
 
 
+def _bake_lazy_importers(
+    module_importers: dict[str, list[str]],
+    module_to_file: dict[str, str],
+    base_sources: dict[str, bytes],
+) -> dict[str, list[str]]:
+    """Augment static `module_importers` with PEP 562 `__getattr__` lazy-import edges
+    from `sqlglot.dialects` and `sqlglot.optimizer` once at map-build time."""
+    aug: dict[str, set[str]] = {m: set(v) for m, v in module_importers.items()}
+
+    def _parse_mod(mod_name: str) -> ast.Module | None:
+        rel = module_to_file.get(mod_name)
+        if not rel or rel not in base_sources:
+            return None
+        try:
+            tree = ast.parse(zlib.decompress(base_sources[rel]))
+            return tree if isinstance(tree, ast.Module) else None
+        except Exception:
+            return None
+
+    lazy_pkg_maps: dict[str, dict[str, str]] = {}
+
+    d_tree = _parse_mod("sqlglot.dialects")
+    if d_tree is not None:
+        dmap: dict[str, str] = {
+            "Dialect": "sqlglot.dialects.dialect",
+            "Dialects": "sqlglot.dialects.dialect",
+        }
+        for st in d_tree.body:
+            if (
+                isinstance(st, ast.Assign)
+                and len(st.targets) == 1
+                and isinstance(st.targets[0], ast.Name)
+                and st.targets[0].id == "DIALECTS"
+                and isinstance(st.value, (ast.List, ast.Tuple))
+            ):
+                for elt in st.value.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        dmap[elt.value] = f"sqlglot.dialects.{elt.value.lower()}"
+        lazy_pkg_maps["sqlglot.dialects"] = dmap
+
+    o_tree = _parse_mod("sqlglot.optimizer")
+    if o_tree is not None:
+        omap: dict[str, str] = {}
+        for st in o_tree.body:
+            val = None
+            if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) and st.targets[0].id == "_LAZY_ATTRS":
+                val = st.value
+            elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.target.id == "_LAZY_ATTRS":
+                val = st.value
+            if isinstance(val, ast.Dict):
+                for k, v in zip(val.keys, val.values):
+                    if (
+                        isinstance(k, ast.Constant)
+                        and isinstance(k.value, str)
+                        and isinstance(v, ast.Tuple)
+                        and v.elts
+                        and isinstance(v.elts[0], ast.Constant)
+                        and isinstance(v.elts[0].value, str)
+                    ):
+                        omap[k.value] = v.elts[0].value
+        lazy_pkg_maps["sqlglot.optimizer"] = omap
+
+    new_edges: list[tuple[str, str]] = []
+    for pkg, amap in lazy_pkg_maps.items():
+        for imp_mod in list(aug.get(pkg, ())):
+            itree = _parse_mod(imp_mod)
+            if itree is None:
+                continue
+            for st in itree.body:
+                if isinstance(st, ast.ImportFrom) and st.module == pkg and st.level == 0:
+                    for alias in st.names:
+                        if alias.name == "*":
+                            for tm in amap.values():
+                                new_edges.append((imp_mod, tm))
+                        elif alias.name in amap:
+                            new_edges.append((imp_mod, amap[alias.name]))
+                        else:
+                            cand_sub = f"{pkg}.{alias.name}"
+                            if cand_sub in module_to_file:
+                                new_edges.append((imp_mod, cand_sub))
+
+    if new_edges:
+        imports_of: dict[str, set[str]] = {}
+        for dep, imps in aug.items():
+            for im in imps:
+                imports_of.setdefault(im, set()).add(dep)
+        for imp_mod, target_mod in new_edges:
+            upstream = {imp_mod} | aug.get(imp_mod, set())
+            downstream = {target_mod} | imports_of.get(target_mod, set())
+            for dep in downstream:
+                aug.setdefault(dep, set()).update(upstream)
+
+    return {m: sorted(v) for m, v in aug.items()}
+
+
+def run_import_probe(sqlglot_dir: Path, out_path: Path) -> None:
+    """Run inside a fresh Python subprocess BEFORE importing sqlglot to record exact:
+      - `import_time_func_lines`: rel -> qualname -> sorted body line numbers executed
+        during import of all `sqlglot/**/*.py` modules and pytest collection of `tests/`.
+      - `import_time_exprs`: sorted Expr subclass names instantiated during import/collection.
+      - `import_time_dict_keys`: (cls_id, attr_name) -> sorted canonical keys looked up
+        via __getitem__/get/__contains__ on base Parser/Generator/Tokenizer/Dialect dicts.
+    """
+    sqlglot_dir = sqlglot_dir.resolve()
+    sg_prefix = sqlglot_dir.as_posix().rstrip("/") + "/"
+
+    # Build AST function index BEFORE importing sqlglot
+    func_firstline_map: dict[tuple[str, int], str] = {}
+    func_spans_by_file: dict[str, list[tuple[int, int, str]]] = {}
+    func_qnames_by_file: dict[str, set[str]] = {}
+    class_names_by_file: dict[str, set[str]] = {}
+
+    for p in sorted((sqlglot_dir / "sqlglot").rglob("*.py")):
+        rel = p.relative_to(sqlglot_dir).as_posix()
+        try:
+            tree = ast.parse(p.read_bytes())
+        except Exception:
+            continue
+        spans: list[tuple[int, int, str]] = []
+        fqset: set[str] = set()
+        cls_names: set[str] = set()
+        scope: list[str] = []
+
+        def _walk(body: list[ast.stmt]) -> None:
+            for st in body:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    qn = ".".join((*scope, st.name))
+                    fqset.add(qn)
+                    start_ln = st.decorator_list[0].lineno if st.decorator_list else st.lineno
+                    end_ln = getattr(st, "end_lineno", st.lineno) or st.lineno
+                    spans.append((start_ln, end_ln, qn))
+                    for ln in range(start_ln, st.lineno + 1):
+                        func_firstline_map[(rel, ln)] = qn
+                    scope.append(st.name)
+                    _walk(st.body)
+                    scope.pop()
+                elif isinstance(st, ast.ClassDef):
+                    cls_names.add(st.name)
+                    scope.append(st.name)
+                    _walk(st.body)
+                    scope.pop()
+
+        _walk(tree.body)
+        func_spans_by_file[rel] = spans
+        func_qnames_by_file[rel] = fqset
+        class_names_by_file[rel] = cls_names
+
+    # Install sys.monitoring LINE tracker before importing sqlglot
+    tool_id = 3
+    mon = sys.monitoring
+    mon.use_tool_id(tool_id, "blast_imp_probe")
+
+    imp_func_lines: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
+    code_cache: dict[object, tuple[str, tuple[str, ...]] | None] = {}
+
+    def _resolve_code(code: Any) -> tuple[str, tuple[str, ...]] | None:
+        fn = Path(code.co_filename).as_posix()
+        if not fn.startswith(sg_prefix):
+            return None
+        rel = fn[len(sg_prefix):]
+        if not rel.startswith("sqlglot/"):
+            return None
+        cname = code.co_name
+        if cname == "<module>" or cname in class_names_by_file.get(rel, ()):
+            return None
+        fq = func_firstline_map.get((rel, code.co_firstlineno))
+        if fq is None:
+            fq = _find_enclosing_func(func_spans_by_file.get(rel, ()), code.co_firstlineno)
+        if fq is None:
+            return None
+        # Attribute executed lines to `fq` AND all enclosing function qualnames
+        fqset = func_qnames_by_file.get(rel, set())
+        targets = [fq]
+        cur = fq
+        while "." in cur:
+            cur = cur.rsplit(".", 1)[0]
+            if cur in fqset:
+                targets.append(cur)
+        return (rel, tuple(targets))
+
+    def _on_line(code: Any, line_number: int) -> Any:
+        info = code_cache.get(code)
+        if info is None:
+            if code in code_cache:
+                return mon.DISABLE
+            info = _resolve_code(code)
+            code_cache[code] = info
+            if info is None:
+                return mon.DISABLE
+        rel, targets = info
+        fdict = imp_func_lines[rel]
+        for tq in targets:
+            fdict[tq].add(line_number)
+        return mon.DISABLE
+
+    mon.register_callback(tool_id, mon.events.LINE, _on_line)
+    mon.set_events(tool_id, mon.events.LINE)
+
+    # Import sqlglot + hook Expr.__init__ and base dicts before dialect/test imports
+    if str(sqlglot_dir) not in sys.path:
+        sys.path.insert(0, str(sqlglot_dir))
+
+    import mapping_profiler as mp
+
+    import sqlglot.expressions.core as _ec
+
+    imp_exprs: set[str] = set()
+    _orig_expr_init = _ec.Expr.__init__
+
+    def _traced_expr_init(self: Any, **kwargs: Any) -> None:
+        imp_exprs.add(type(self).__name__)
+        return _orig_expr_init(self, **kwargs)
+
+    _ec.Expr.__init__ = _traced_expr_init  # type: ignore[method-assign]
+
+    import sqlglot.dialects.dialect as _dial_mod
+    import sqlglot.generator as _gen_mod
+    import sqlglot.parser as _parser_mod
+    import sqlglot.tokens as _tok_mod
+
+    imp_dict_keys: dict[tuple[str, str], set[tuple[Any, ...]]] = defaultdict(set)
+
+    class _ImpTrackDict(dict):
+        def __init__(self, tag: tuple[str, str], orig: dict[Any, Any]) -> None:
+            super().__init__(orig)
+            self._tag = tag
+
+        def __getitem__(self, k: Any) -> Any:
+            ck = mp.canonicalize_runtime_key(k)
+            if ck is not None:
+                imp_dict_keys[self._tag].add(ck)
+            return super().__getitem__(k)
+
+        def get(self, k: Any, default: Any = None) -> Any:
+            ck = mp.canonicalize_runtime_key(k)
+            if ck is not None:
+                imp_dict_keys[self._tag].add(ck)
+            return super().get(k, default)
+
+        def __contains__(self, k: object) -> bool:
+            ck = mp.canonicalize_runtime_key(k)
+            if ck is not None:
+                imp_dict_keys[self._tag].add(ck)
+            return super().__contains__(k)
+
+    for cls_tag, cls in (
+        ("sqlglot/parser.py:Parser", _parser_mod.Parser),
+        ("sqlglot/generator.py:Generator", _gen_mod.Generator),
+        ("sqlglot/tokens.py:Tokenizer", _tok_mod.Tokenizer),
+        ("sqlglot/dialects/dialect.py:Dialect", _dial_mod.Dialect),
+    ):
+        for attr, val in list(cls.__dict__.items()):
+            if isinstance(val, dict) and attr.isupper():
+                setattr(cls, attr, _ImpTrackDict((cls_tag, attr), val))
+
+    # Import all sqlglot/**/*.py modules
+    for p in sorted((sqlglot_dir / "sqlglot").rglob("*.py")):
+        parts = list(p.relative_to(sqlglot_dir).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if not parts or any(pt.startswith("_") and pt != "_typing" for pt in parts):
+            continue
+        try:
+            importlib.import_module(".".join(parts))
+        except Exception:
+            pass
+
+    # Import all tests/**/test_*.py modules AND run pytest --collect-only
+    for tf in sorted((sqlglot_dir / "tests").rglob("test_*.py")):
+        mod = ".".join(tf.relative_to(sqlglot_dir).with_suffix("").parts)
+        try:
+            importlib.import_module(mod)
+        except Exception:
+            pass
+
+    try:
+        import pytest
+
+        os.chdir(sqlglot_dir)
+        pytest.main(["--collect-only", "-q", "-p", "no:cacheprovider", "-o", "addopts=", "tests"])
+    except Exception:
+        pass
+
+    mon.set_events(tool_id, 0)
+    mon.free_tool_id(tool_id)
+
+    payload = {
+        "import_time_func_lines": {
+            rel: {fq: sorted(ls) for fq, ls in sorted(fdict.items())}
+            for rel, fdict in sorted(imp_func_lines.items())
+        },
+        "import_time_exprs": sorted(imp_exprs),
+        "import_time_dict_keys": {
+            tag: sorted(ks, key=str) for tag, ks in sorted(imp_dict_keys.items())
+        },
+    }
+    out_path.write_bytes(pickle.dumps(payload, protocol=4))
+
+
+def _run_import_probe_2x(sqlglot_dir: Path) -> dict[str, Any]:
+    """Run `run_import_probe` twice in fresh subprocesses and union conservatively."""
+    runs: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="blast_imp_probe_") as td:
+        for i in range(2):
+            op = Path(td) / f"imp_{i}.pkl"
+            env = os.environ.copy()
+            env["SKIP_INTEGRATION"] = "0"
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            cmd = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--import-probe",
+                "--sqlglot-dir",
+                str(sqlglot_dir),
+                "--shard-out",
+                str(op),
+            ]
+            res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            if res.returncode != 0:
+                raise RuntimeError(f"import-probe run {i} failed: {res.stderr[-500:]}")
+            runs.append(pickle.loads(op.read_bytes()))
+
+    # Conservative union across both runs (and log any differences)
+    fl_union: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
+    expr_union: set[str] = set()
+    dk_union: dict[tuple[str, str], set[tuple[Any, ...]]] = defaultdict(set)
+    for r in runs:
+        for rel, fd in r["import_time_func_lines"].items():
+            for fq, ls in fd.items():
+                fl_union[rel][fq].update(ls)
+        expr_union.update(r["import_time_exprs"])
+        for tag, ks in r["import_time_dict_keys"].items():
+            dk_union[tag].update(ks)
+
+    same_fl = runs[0]["import_time_func_lines"] == runs[1]["import_time_func_lines"]
+    same_ex = runs[0]["import_time_exprs"] == runs[1]["import_time_exprs"]
+    same_dk = runs[0]["import_time_dict_keys"] == runs[1]["import_time_dict_keys"]
+    n_funcs = sum(len(d) for d in fl_union.values())
+    n_lines = sum(len(ls) for d in fl_union.values() for ls in d.values())
+    print(
+        f"[build_map] 2x import-probe stable=(fl={same_fl}, expr={same_ex}, dk={same_dk}): "
+        f"{len(fl_union)} files, {n_funcs} funcs, {n_lines} lines, "
+        f"{len(expr_union)} exprs, {len(dk_union)} base dict tables",
+        file=sys.stderr,
+    )
+    return {
+        "import_time_func_lines": {
+            rel: {fq: sorted(ls) for fq, ls in sorted(fd.items())}
+            for rel, fd in sorted(fl_union.items())
+        },
+        "import_time_exprs": sorted(expr_union),
+        "import_time_dict_keys": {
+            tag: sorted(ks, key=str) for tag, ks in sorted(dk_union.items())
+        },
+    }
+
+
+def update_map_import_data(sqlglot_dir: Path, map_path: Path) -> None:
+    """Fast (~10 s) update of an existing `map.pkl.gz` with 2x import-time line/expr/dict
+    probe data and baked PEP 562 lazy importer edges (preserving all per-test bitsets)."""
+    t0 = time.perf_counter()
+    data = pickle.loads(zlib.decompress(map_path.read_bytes()))
+    imp_data = _run_import_probe_2x(sqlglot_dir)
+    data["import_time_func_lines"] = imp_data["import_time_func_lines"]
+    data["import_time_exprs"] = imp_data["import_time_exprs"]
+    data["import_time_dict_keys"] = imp_data["import_time_dict_keys"]
+    data["module_importers"] = _bake_lazy_importers(
+        data["module_importers"], data["module_to_file"], data["base_sources"]
+    )
+    data["lazy_importers_baked"] = True
+    raw_pkl = pickle.dumps(data, protocol=4)
+    comp = zlib.compress(raw_pkl, level=9)
+    map_path.write_bytes(comp)
+    os.chmod(map_path, 0o644)
+    print(
+        f"[build_map] Updated {map_path} in {time.perf_counter()-t0:.1f}s "
+        f"(size={len(comp)/1e6:.2f} MB, raw={len(raw_pkl)/1e6:.2f} MB)",
+        file=sys.stderr,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build Blast-Radius map from pinned sqlglot commit.")
     parser.add_argument("--sqlglot-dir", type=Path, default=Path("/sqlglot"))
@@ -1138,6 +1528,8 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--verify-tests-json", type=Path, default=None)
     parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--import-probe", action="store_true")
+    parser.add_argument("--update-import-data", type=Path, default=None)
     parser.add_argument("--shard-out", type=Path, default=None)
     parser.add_argument("--shard-files", nargs="*", default=[])
     args = parser.parse_args()
@@ -1145,6 +1537,11 @@ def main() -> None:
     if args.worker:
         assert args.shard_out is not None
         run_worker(args.sqlglot_dir, args.shard_files, args.shard_out)
+    elif args.import_probe:
+        assert args.shard_out is not None
+        run_import_probe(args.sqlglot_dir, args.shard_out)
+    elif args.update_import_data is not None:
+        update_map_import_data(args.sqlglot_dir, args.update_import_data)
     else:
         build_map(args.sqlglot_dir, args.output, args.workers, args.verify_tests_json)
 

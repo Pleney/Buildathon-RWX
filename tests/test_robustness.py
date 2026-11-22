@@ -596,7 +596,10 @@ class TestRobustness(unittest.TestCase):
         self.assertEqual(len(self._validate_line("dtype", self.selector.select_and_pack("dtype", p_dt))), len(self.tests_list))
 
         q_src = self._base_text("sqlglot/expressions/query.py")
-        p_sel = _make_unified_diff("sqlglot/expressions/query.py", q_src, q_src.replace('"with_": False,', '"with_": True,', 1))
+        sel_idx = q_src.index("class Select(")
+        sel_head = q_src[:sel_idx]
+        sel_tail = q_src[sel_idx:].replace('"with_": False,', '"with_": True,', 1)
+        p_sel = _make_unified_diff("sqlglot/expressions/query.py", q_src, sel_head + sel_tail)
         self.assertEqual(len(self._validate_line("sel_arg", self.selector.select_and_pack("sel_arg", p_sel))), len(self.tests_list))
 
         par_src = self._base_text("sqlglot/parser.py")
@@ -618,6 +621,33 @@ class TestRobustness(unittest.TestCase):
             s = sel.BlastRadiusSelector(md, self.tests_list)
             p = "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1,1 +1,2 @@\n # x\n+y\n"
             self.assertEqual(s.select_and_pack("corrupt_prof_ok", p)["workers"], [])
+
+    def test_precise_import_time_line_and_key_escalation(self) -> None:
+        # 1. Unexecuted line inside an import_time_func (unchanged scope) must NOT escalate to 1,620
+        par = self._base_text("sqlglot/parser.py")
+        p_mn = _make_unified_diff(
+            "sqlglot/parser.py",
+            par,
+            par.replace(
+                'f"Maximum number of AST nodes ({self.max_nodes}) exceeded"',
+                'f"MAX_NODES_MSG ({self.max_nodes}) exceeded"',
+                1,
+            ),
+        )
+        flat_mn = self._validate_line("prec_mn", self.selector.select_and_pack("prec_mn", p_mn))
+        self.assertGreaterEqual(len(flat_mn), 1)
+        self.assertLess(len(flat_mn), 50, f"Unexecuted import-time line escalated coarsely: {len(flat_mn)}")
+
+        # 2. Non-import-time key in Parser.RANGE_PARSERS must NOT escalate to 1,620
+        jp = self._base_text("sqlglot/jsonpath.py")
+        p_jperr = _make_unified_diff(
+            "sqlglot/jsonpath.py",
+            jp,
+            jp.replace("Unexpected", "CHANGED_UNEXP", 1),
+        )
+        flat_jp = self._validate_line("prec_jp", self.selector.select_and_pack("prec_jp", p_jperr))
+        self.assertGreaterEqual(len(flat_jp), 1)
+        self.assertLess(len(flat_jp), 50, f"Unexecuted jsonpath error line escalated coarsely: {len(flat_jp)}")
 
 
 if __name__ == "__main__":

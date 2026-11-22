@@ -215,6 +215,19 @@ class BlastRadiusSelector:
         self.import_time_funcs: dict[str, set[str]] = {
             k: set(v) for k, v in self.m.get("import_time_funcs", {}).items()
         }
+        self.import_time_func_lines: dict[str, dict[str, frozenset[int]]] = {
+            rel: {fq: frozenset(ls) for fq, ls in fdict.items()}
+            for rel, fdict in self.m.get("import_time_func_lines", {}).items()
+        }
+        self.import_time_exprs: frozenset[str] = frozenset(self.m.get("import_time_exprs", ()))
+        self.import_time_dict_keys: dict[tuple[str, str], frozenset[Any]] = {
+            k: frozenset(v) for k, v in self.m.get("import_time_dict_keys", {}).items()
+        }
+        self._lazy_importers_baked: bool = bool(self.m.get("lazy_importers_baked", False))
+        self._all_expr_cls_ids: frozenset[str] = (
+            frozenset(self.class_subclasses.get("sqlglot/expressions/core.py:Expr", ()))
+            | {"sqlglot/expressions/core.py:Expr"}
+        )
 
         # Tests that spawn subprocesses or were not profiled in-process -> never drop via unreached
         self._unprofiled_test_bits: int = 0
@@ -246,6 +259,7 @@ class BlastRadiusSelector:
         self._lazy_importers_ready: bool = False
         self._metaclass_compiled_attrs: set[str] | None = None
         self._augmented_module_importers: dict[str, set[str]] | None = None
+        self._importer_tests_cache: dict[str, int] = {}
         self._test_name_refs_cache: dict[str, int] | None = None
         for rel, info in self.ast_index.items():
             if not rel.startswith("sqlglot/"):
@@ -596,10 +610,12 @@ class BlastRadiusSelector:
                     return True
         return False
 
-    def _ensure_lazy_importers(self) -> dict[str, set[str]]:
+    def _ensure_lazy_importers(self) -> dict[str, Any]:
         """Augment static `module_importers` with PEP 562 `__getattr__` lazy-import edges
         (e.g., `from sqlglot.dialects import BigQuery` in `tests/dialects/test_dialect.py`
         transitively imports `sqlglot.dialects.bigquery`, `sqlglot.typing.bigquery`, etc.)."""
+        if self._lazy_importers_baked:
+            return self.module_importers
         if self._augmented_module_importers is not None:
             return self._augmented_module_importers
 
@@ -649,10 +665,18 @@ class BlastRadiusSelector:
                             omap[k.value] = v.elts[0].value
             lazy_pkg_maps["sqlglot.optimizer"] = omap
 
-        # 2. Discover direct lazy `from <pkg> import <attr>` edges in modules importing <pkg>
+        # 2. Discover direct lazy `from <pkg> import <attr>` edges (bytes pre-filter avoids
+        #    parsing hundreds of unrelated transitive importers!)
         new_edges: list[tuple[str, str]] = []  # (importer_mod, target_mod)
         for pkg, amap in lazy_pkg_maps.items():
+            needle = f"from {pkg} import".encode("ascii")
             for imp_mod in list(aug.get(pkg, ())):
+                imp_rel = self.module_to_file.get(imp_mod)
+                if not imp_rel:
+                    continue
+                raw = self._get_base_source(imp_rel)
+                if raw is None or needle not in raw:
+                    continue
                 itree = self._get_module_ast(imp_mod)
                 if not isinstance(itree, ast.Module):
                     continue
@@ -689,6 +713,9 @@ class BlastRadiusSelector:
 
     def _importer_tests(self, rel: str) -> int:
         """All tests in files that transitively import `rel` (plus direct exec/dialect tests)."""
+        cached = self._importer_tests_cache.get(rel)
+        if cached is not None:
+            return cached
         bits = self.module_exec_tests.get(rel, 0) | self.dialect_to_tests.get(rel, 0)
         mod = self.file_to_module.get(rel)
         if mod:
@@ -702,7 +729,23 @@ class BlastRadiusSelector:
                 else:
                     bits |= self.module_exec_tests.get(imp_rel, 0)
                     bits |= self.dialect_to_tests.get(imp_rel, 0)
+        self._importer_tests_cache[rel] = bits
         return bits
+
+    def _expr_used_at_import(self, rel: str, cls_qname: str) -> bool:
+        """Return True iff `cls_qname` or any transitive subclass was instantiated during
+        module import / test collection."""
+        short = cls_qname.split(".")[-1]
+        if self.import_time_exprs:
+            if short in self.import_time_exprs:
+                return True
+            cls_id = f"{rel}:{cls_qname}"
+            for sub_id in self.class_subclasses.get(cls_id, ()):
+                sub_short = sub_id.split(":", 1)[1].split(".")[-1]
+                if sub_short in self.import_time_exprs:
+                    return True
+            return False
+        return self._is_import_time_referenced_name(short)
 
     def _test_method_refs_for_name(self, name: str) -> int:
         """All test methods in `tests/` whose AST statically references `name`
@@ -969,18 +1012,12 @@ class BlastRadiusSelector:
         new_tree = ana.new_tree
         has_future_ann = self._has_future_annotations(new_tree)
         imp_fns = self.import_time_funcs.get(rel, ())
+        has_imp_line_data = bool(self.import_time_func_lines)
+        imp_fl_by_func = self.import_time_func_lines.get(rel, {})
 
         any_scope_changed = False
         for fq in ana.changed_funcs:
             if fq in safe_added_public_funcs:
-                continue
-            # Any function recorded as running during module import (metaclasses,
-            # __init_subclass__, decorator factories, import-time parse helpers) can
-            # fail every module importer at collection/import time.
-            if fq in imp_fns:
-                imp_bits = self._importer_tests(rel)
-                self._add_prob(probs, imp_bits if imp_bits else self.all_map_bits, cfg["p_direct"])
-                any_scope_changed = True
                 continue
             ftests = file_fmap.get(fq, 0)
             span = func_spans.get(fq)
@@ -996,14 +1033,43 @@ class BlastRadiusSelector:
             )
             direct_line_bits = 0
             enclosing_stmt_bits = 0
+            fn_stmt_spans: list[tuple[int, int]] = []
             for ln in fn_changed_lines:
                 direct_line_bits |= file_lmap.get(ln, 0)
                 st_span = self._enclosing_stmt_lines(rel, ln)
                 if st_span is not None:
+                    fn_stmt_spans.append(st_span)
                     # Include tests executing the enclosing statement (handles multiline
                     # boolean conditions / short-circuiting / else branches)
                     for sln in range(st_span[0], st_span[1] + 1):
                         enclosing_stmt_bits |= file_lmap.get(sln, 0)
+
+            # Precise First-Divergence import/collection-time check:
+            # A function called during module import / pytest collection can only alter
+            # import-time behaviour if (a) its compile-time signature/decorators/defaults/
+            # annotations/locals/docstring/yield-ness changed (`scope_changed`), OR (b) at
+            # least one changed line or its enclosing statement actually executed during
+            # import/collection (`imp_fl`). Otherwise import execution cannot diverge and
+            # normal test-body coverage + profile provers apply soundly.
+            if has_imp_line_data:
+                imp_fl = imp_fl_by_func.get(fq)
+                if imp_fl:
+                    imp_line_hit = (
+                        scope_changed
+                        or any(ln in imp_fl for ln in fn_changed_lines)
+                        or any(sln in imp_fl for s, e in fn_stmt_spans for sln in range(s, e + 1))
+                    )
+                    if imp_line_hit:
+                        imp_bits = self._importer_tests(rel)
+                        self._add_prob(probs, imp_bits if imp_bits else self.all_map_bits, cfg["p_direct"])
+                        any_scope_changed = True
+                        continue
+            elif fq in imp_fns:
+                # Fallback when `import_time_func_lines` is absent on an older map
+                imp_bits = self._importer_tests(rel)
+                self._add_prob(probs, imp_bits if imp_bits else self.all_map_bits, cfg["p_direct"])
+                any_scope_changed = True
+                continue
 
             if scope_changed:
                 # Without `from __future__ import annotations`, parameter and return
@@ -1102,14 +1168,46 @@ class BlastRadiusSelector:
             # Base-class tables in core tokenizer/parser/generator/dialect that are read by
             # import-time functions can break module importers during test collection before
             # per-test line or mapping profiling runs (even when the entry value is a lambda!).
-            is_base_imp_table = (
-                rel in ("sqlglot/tokens.py", "sqlglot/parser.py", "sqlglot/generator.py", "sqlglot/dialects/dialect.py")
-                and self._is_import_time_referenced_name(attr_name, also_lower=True)
+            # When exact `import_time_dict_keys` is present and the edit is a clean, pure,
+            # spread-preserving dict key edit, escalate ONLY if a changed/added/removed key
+            # was actually looked up at import time (or key set changed on a trie/key-derived table).
+            is_core_base = rel in (
+                "sqlglot/tokens.py",
+                "sqlglot/parser.py",
+                "sqlglot/generator.py",
+                "sqlglot/dialects/dialect.py",
             )
-            if is_base_imp_table:
-                imp_bits = self._importer_tests(rel)
-                self._add_prob(probs, imp_bits if imp_bits else self.all_map_bits, cfg["p_direct"])
-                continue
+            if is_core_base and self._is_import_time_referenced_name(attr_name, also_lower=True):
+                escalate_base = True
+                if (
+                    self.import_time_dict_keys
+                    and _mapping_profiler_mod is not None
+                    and attr_name in _mapping_profiler_mod.TRACKED_CLASS_DICT_ATTRS
+                    and ana.old_tree is not None
+                    and ana.new_tree is not None
+                ):
+                    dict_diff = _mapping_profiler_mod.diff_class_dict_typed(
+                        ana.old_tree,
+                        ana.new_tree,
+                        cq,
+                        attr_name,
+                        resolve_module_tree=self._get_module_ast,
+                    )
+                    if dict_diff is not None:
+                        chg_v, add_k, rem_k, _, _ = dict_diff
+                        vals_only = (not add_k) and (not rem_k)
+                        key_derived = (
+                            attr_name in _mapping_profiler_mod.KEYS_DERIVED_ATTRS
+                            or attr_name == _mapping_profiler_mod.TIME_MAPPING_ATTR
+                        )
+                        if not (key_derived and not vals_only):
+                            imp_keys = self.import_time_dict_keys.get((f"{rel}:{cq}", attr_name), frozenset())
+                            if not any(k in imp_keys for k in (chg_v | add_k | rem_k)):
+                                escalate_base = False
+                if escalate_base:
+                    imp_bits = self._importer_tests(rel)
+                    self._add_prob(probs, imp_bits if imp_bits else self.all_map_bits, cfg["p_direct"])
+                    continue
 
             # Only treat direct line coverage as a runtime hit when the changed line is
             # inside a lambda (avoiding accidental lazy-import first-test hits on class bodies!)
@@ -1127,17 +1225,16 @@ class BlastRadiusSelector:
 
             # Expression module class attribute (e.g. TriggerProperties.arg_types vs DType Enum)
             if rel.startswith("sqlglot/expressions/"):
-                short_cls = cq.split(".")[-1]
-                if short_cls not in self.expr_class_file and short_cls != "Expr":
+                if f"{rel}:{cq}" not in self._all_expr_cls_ids:
                     # Non-Expr class inside sqlglot/expressions/ (e.g. DType Enum):
                     # enum members feed class-body dicts at import time -> all importers.
                     imp_bits = self._importer_tests(rel)
                     self._add_prob(probs, imp_bits if imp_bits else self.all_map_bits, cfg["p_direct"])
                     continue
                 ebits = self._expr_hierarchy_tests(rel, cq)
-                # Expr classes constructed by import-time parsers/helpers (e.g. Select) can
+                # Expr classes constructed during import/collection (e.g. Select) can
                 # fail importers during collection if arg_types/required_args change.
-                if self._is_import_time_referenced_name(short_cls):
+                if self._expr_used_at_import(rel, cq):
                     ebits |= self._importer_tests(rel)
                 if ebits:
                     self._add_prob(probs, ebits, cfg["p_expr_attr"])
