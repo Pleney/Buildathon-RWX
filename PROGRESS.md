@@ -56,3 +56,17 @@
   - 2x single-process plain-pytest-order stability build (`build_profiles.py`): Run 1 `401.5 s`, Run 2 `395.4 s`, 1,620 passed, 0 failed; **7,786/7,786 expr, 6,042/6,042 reach, 461/461 mapping, 235/235 range, 643/644 const (1 unstable auto-dropped), 599/599 default funcs** stable; `profiles.pkl.gz = 0.71 MB` (`map + profiles = 2.95 MB`).
   - Gate 6/6 **PASS**: `sim=101.564s cpu=1.213s total=102.777s misses=0 diff_wrong=0 (65 quick edits incl. 7 Phase 4 cases, 4,864 dropped tests verified by real pytest) build=42.8s batch15x=2.2s art=2.95MB repo=14.16MB`.
   - Proceeding to commit on `work`, verify post-commit repo `<= 15 MB`, and merge **CHECKPOINT 4** to `main`.
+- **2026-11-22 07:04 SGT** — **CHECKPOINT 4 MERGED & PUSHED TO `origin/main`**: `401eab5f90ae7fce33c9a5881a098bc91aef952a` (post-merge repo size `14.94 MB` unpacked -> `10.71 MB` after lossless `git gc --prune=never`: `.git=7.23MB + tracked=3.47MB`, 146 objects intact).
+- **2026-11-22 07:43 SGT** — **Phase 5 (Broader Evaluation across 76 brand-new edits in 9 diverse edit families + 20% hold-out)** completed with real `pytest` ground truth (`0` timeouts, `76/76` evaluated):
+  - Fixed two ground-truth harness parser bugs in `scratch/broader_eval_p5.py` (nodeid substring prefix collisions like `test_mysql` matching `test_mysql_time`, and pytest `RC=4` collection errors aborting multi-file chunks) after verifying all 116 initially flagged tests passed (`RC=0`) in real `pytest`.
+  - **Result**: **`0` misses across ALL 232 evaluated edits** (30 real samples + 126 original synthetic edits + 76 brand-new Phase 5 edits, including **41 unseen hold-out edits**).
+  - **76 brand-new Phase 5 edits**: `637.44 s -> 377.75 s` (**`-259.69 s`**, `-40.7%`, closing `48.7%` of gap to `103.74 s` oracle, **`0` misses**); on 21 unseen hold-out edits: `176.76 s -> 96.64 s` (**`-80.12 s`**, `-45.3%`, closing `49.7%` of gap to `15.55 s` oracle, **`0` misses**).
+  - **Combined 41 unseen hold-out edits (20 old + 21 new)**: `227.43 s` (`2a3d3cb` baseline) -> **`143.22 s`** (**`-84.21 s`**, `-37.0%`, **`0` misses**).
+  - **30 real samples (reported separately)**: `109.635 s -> 101.564 s` (**`-8.071 s`**, cutting gap to `94.351 s` oracle by `52.8%` from `15.284 s -> 7.213 s`, **`0` misses**).
+- **2026-11-22 08:00 SGT** — **Phase 6 (Slim `Dockerfile`, Hygiene, Docs & `MORNING_REPORT.md`)** (2h 30m ahead of 10:30 SGT feature freeze!):
+  - Audited all runtime imports (100% Python stdlib; zero third-party deps; `/sqlglot` unused when `BLAST_VERIFIER_MODE=off`).
+  - Slimmed `Dockerfile` to `python:3.13-slim@sha256:...` + `/app` stdlib modules + `map.pkl.gz` + `profiles.pkl.gz` + `CMD ["python", "-S", "-E", "/app/selector.py"]`: no-cache Docker build dropped **`42.8 s -> 1.4 s`** (**30x faster**, zero network fetches during judge builds, `185 MB` image).
+  - Pre-doc `gate.sh` on slim `Dockerfile` **PASS 6/6**: `sim=101.564s cpu=1.327s total=102.891s misses=0 diff_wrong=0 (65 quick edits, 4,864 dropped tests verified by real pytest) build=1.4s batch15x=2.2s art=2.95MB repo=10.71MB`.
+  - Updated `README.md`, `NOTES.md`, `CANDIDATES.md`, `MORNING_REPORT.md`, and `gate_runner.py` (`diff_test --quick` timeout `900 -> 1200 s` for comfortable bind-mount headroom).
+  - Running final `gate.sh` verification before **CHECKPOINT 5 (Final)** merge to `main` and push!
+
