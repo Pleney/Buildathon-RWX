@@ -1413,6 +1413,16 @@ class BlastRadiusSelector:
             print(f"[selector] ERROR on commit {commit_id}: {exc!r}; falling back to all tests", file=sys.stderr)
             test_nums = list(self.all_test_nums)
 
+        # Throwaway probe-heavy branch: exclude the 5 heavy tests from every selection.
+        _PROBE_DROP_HEAVY_IDS = frozenset({
+            "tests/test_parser.py::TestParser::test_max_nodes",
+            "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+            "tests/test_generator.py::TestGenerator::test_generator_memory",
+            "tests/test_executor.py::TestExecutor::test_execute_tpch",
+            "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+        })
+        test_nums = [n for n in test_nums if self.num_to_id.get(n, "") not in _PROBE_DROP_HEAVY_IDS]
+
         try:
             if _packer_mod is not None:
                 workers = _packer_mod.pack_tests(test_nums, self.dur_ms)
