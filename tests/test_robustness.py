@@ -413,6 +413,109 @@ class TestRobustness(unittest.TestCase):
         )
         self.assertGreater(len(flat_cls), 500)
 
+    # --- 11. Unseen edge cases: cross-category renames, hunk boundaries, CRLF/tabs/EOF, sqlglotc/dotfiles ---
+    def test_cross_category_renames_never_drop_source_or_fixture(self) -> None:
+        renames = [
+            ("ren_sg_docs", "sqlglot/anonymize.py", "docs/anonymize.md", 20),
+            ("ren_sg_bench", "sqlglot/lineage.py", "benchmarks/lineage.py", 50),
+            ("ren_sg_sgc", "sqlglot/anonymize.py", "sqlglotc/anonymize.py", len(self.tests_list)),
+            ("ren_fix_docs", "tests/fixtures/jsonpath/cts.json", "docs/cts.json", 1),
+            ("ren_test_docs", "tests/test_anonymize.py", "docs/test_anonymize.md", 20),
+            ("ren_docs_sg", "README.md", "sqlglot/from_readme.py", len(self.tests_list)),
+        ]
+        for cid, old_p, new_p, min_expected in renames:
+            patch = (
+                f"diff --git a/{old_p} b/{new_p}\n"
+                "similarity index 100%\n"
+                f"rename from {old_p}\n"
+                f"rename to {new_p}\n"
+            )
+            flat = self._validate_line(cid, self.selector.select_and_pack(cid, patch))
+            self.assertGreaterEqual(len(flat), min_expected, f"Too few tests for {cid}: {len(flat)}")
+
+    def test_hunk_boundary_and_formatting_edge_cases(self) -> None:
+        # 1. Deleted `-- ...` (`--- ...`) followed by added `++ ...` (`+++ ...`) inside active hunk
+        triple_dash = (
+            "diff --git a/tests/fixtures/optimizer/simplify.sql b/tests/fixtures/optimizer/simplify.sql\n"
+            "--- a/tests/fixtures/optimizer/simplify.sql\n"
+            "+++ b/tests/fixtures/optimizer/simplify.sql\n"
+            "@@ -1,5 +1,5 @@\n"
+            " --------------------------------------\n"
+            "--- Conditions\n"
+            "+++ BROKEN SQL LINE\n"
+            " --------------------------------------\n"
+            " x AND x;\n"
+            " x AND TRUE;\n"
+        )
+        parsed = pp.parse_unified_diff(triple_dash)
+        self.assertFalse(parsed.parse_error)
+        self.assertEqual(len(parsed.files), 1)
+        self.assertEqual(parsed.files[0].path, "tests/fixtures/optimizer/simplify.sql")
+        flat_td = self._validate_line("triple_dash", self.selector.select_and_pack("triple_dash", triple_dash))
+        self.assertEqual(len(flat_td), 1)
+
+        # 2. CRLF patch, tabs in header timestamps, mode change + code, no trailing newline
+        rel = "sqlglot/anonymize.py"
+        old = self._base_text(rel)
+        new_bug = old.replace("dialect = Dialect.get_or_raise(dialect)", "raise RuntimeError('bug')", 1)
+        base_diff = _make_unified_diff(rel, old, new_bug)
+
+        # CRLF endings
+        flat_crlf = self._validate_line("crlf", self.selector.select_and_pack("crlf", base_diff.replace("\n", "\r\n")))
+        self.assertGreaterEqual(len(flat_crlf), 20)
+
+        # Mode change + code hunk
+        mode_diff = base_diff.replace(f"--- a/{rel}\n", f"old mode 100644\nnew mode 100755\n--- a/{rel}\n", 1)
+        flat_mode = self._validate_line("mode_code", self.selector.select_and_pack("mode_code", mode_diff))
+        self.assertEqual(flat_crlf, flat_mode)
+
+        # Tabbed timestamps in --- / +++ headers
+        tab_diff = base_diff.replace(f"--- a/{rel}\n", f"--- a/{rel}\t2026-01-01\n", 1).replace(
+            f"+++ b/{rel}\n", f"+++ b/{rel}\t2026-01-01\n", 1
+        )
+        flat_tab = self._validate_line("tab_hdr", self.selector.select_and_pack("tab_hdr", tab_diff))
+        self.assertEqual(flat_crlf, flat_tab)
+
+        # No trailing newline at EOF
+        new_nonl = old.replace('return "".join(result)', 'return "BAD"', 1).rstrip("\n")
+        diff_nonl = _make_unified_diff(rel, old, new_nonl)
+        if not diff_nonl.endswith("\\ No newline at end of file\n"):
+            diff_nonl += "\\ No newline at end of file\n"
+        flat_nonl = self._validate_line("nonl", self.selector.select_and_pack("nonl", diff_nonl))
+        self.assertGreaterEqual(len(flat_nonl), 10)
+
+    def test_sqlglotc_strict_whitelist_and_dotfiles(self) -> None:
+        # Allowed packaging files -> test_sqlglotc.py only
+        for rel in ("sqlglotc/setup.py", "sqlglotc/pyproject.toml", "sqlglotc/MANIFEST.in"):
+            p = f"diff --git a/{rel} b/{rel}\n--- a/{rel}\n+++ b/{rel}\n@@ -1,1 +1,1 @@\n-a\n+b\n"
+            flat = self._validate_line(rel, self.selector.select_and_pack(rel, p))
+            self.assertEqual(len(flat), 3, f"Expected only 3 test_sqlglotc tests for {rel}")
+
+        # Any other sqlglotc/ file, deletion, dotfile CI, integration-tests, new subpkg, non-fixture tests/ -> ALL tests
+        broad_patches = [
+            ("sgc_new_py", "diff --git a/sqlglotc/extra.py b/sqlglotc/extra.py\nnew file mode 100644\n--- /dev/null\n+++ b/sqlglotc/extra.py\n@@ -0,0 +1,1 @@\n+x = 1\n"),
+            ("sgc_del", "diff --git a/sqlglotc/setup.py b/sqlglotc/setup.py\ndeleted file mode 100644\n--- a/sqlglotc/setup.py\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-x\n"),
+            ("sgc_hdr", "diff --git a/sqlglotc/ext.h b/sqlglotc/ext.h\n--- a/sqlglotc/ext.h\n+++ b/sqlglotc/ext.h\n@@ -1,1 +1,1 @@\n-a\n+b\n"),
+            ("gh_wf", "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n@@ -1,1 +1,1 @@\n-a\n+b\n"),
+            ("pre_commit", "diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml\n--- a/.pre-commit-config.yaml\n+++ b/.pre-commit-config.yaml\n@@ -1,1 +1,1 @@\n-a\n+b\n"),
+            ("integ_md", "diff --git a/sqlglot-integration-tests/README.md b/sqlglot-integration-tests/README.md\n--- a/sqlglot-integration-tests/README.md\n+++ b/sqlglot-integration-tests/README.md\n@@ -1,1 +1,1 @@\n-a\n+b\n"),
+            ("new_subpkg", "diff --git a/sqlglot/newsub/__init__.py b/sqlglot/newsub/__init__.py\nnew file mode 100644\n--- /dev/null\n+++ b/sqlglot/newsub/__init__.py\n@@ -0,0 +1,1 @@\n+X = 1\n"),
+            ("tests_txt", "diff --git a/tests/raw_data.txt b/tests/raw_data.txt\nnew file mode 100644\n--- /dev/null\n+++ b/tests/raw_data.txt\n@@ -0,0 +1,1 @@\n+hi\n"),
+        ]
+        for cid, p in broad_patches:
+            flat = self._validate_line(cid, self.selector.select_and_pack(cid, p))
+            self.assertEqual(len(flat), len(self.tests_list), f"Expected all tests for {cid}")
+
+        self.assertEqual(pp.classify_file(".github/workflows/ci.yml"), "config")
+        self.assertEqual(pp.classify_file(".pre-commit-config.yaml"), "config")
+        self.assertEqual(pp.classify_file(".github/ISSUE_TEMPLATE/bug_report.md"), "docs")
+
+    def test_docs_dirs_empty_and_mixed_commit_union(self) -> None:
+        for rel in ("benchmarks/parse.py", "pdoc/cli.py", "posts/ast_primer.md", "README.md", "docs/guide.md"):
+            p = f"diff --git a/{rel} b/{rel}\n--- a/{rel}\n+++ b/{rel}\n@@ -1,1 +1,1 @@\n-a\n+b\n"
+            flat = self._validate_line(rel, self.selector.select_and_pack(rel, p))
+            self.assertEqual(flat, [], f"Expected [] for docs path {rel}")
+
 
 if __name__ == "__main__":
     unittest.main()
