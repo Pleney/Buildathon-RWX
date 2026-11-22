@@ -516,6 +516,109 @@ class TestRobustness(unittest.TestCase):
             flat = self._validate_line(rel, self.selector.select_and_pack(rel, p))
             self.assertEqual(flat, [], f"Expected [] for docs path {rel}")
 
+    def test_u0_pure_insertion_exact_apply_and_selection(self) -> None:
+        import difflib
+
+        rel = "sqlglot/jsonpath.py"
+        old = self._base_text(rel)
+        target = "def parse(path: str, dialect: DialectType = None) -> exp.JSONPath:\n"
+        self.assertIn(target, old)
+        new = old.replace(target, target + "    raise RuntimeError('u0')\n", 1)
+        u0_patch = f"diff --git a/{rel} b/{rel}\n" + "".join(
+            difflib.unified_diff(old.splitlines(True), new.splitlines(True), f"a/{rel}", f"b/{rel}", n=0)
+        )
+        parsed = pp.parse_unified_diff(u0_patch)
+        self.assertFalse(parsed.parse_error)
+        applied = pp.apply_hunks(old.encode("utf-8"), parsed.files[0].hunks)
+        self.assertEqual(applied, new.encode("utf-8"), "-U0 pure insertion shifted lines in apply_hunks")
+        flat = self._validate_line("u0_jp", self.selector.select_and_pack("u0_jp", u0_patch))
+        self.assertEqual(len(flat), len(self.tests_list))
+
+    def test_import_time_funcs_and_no_future_annotations(self) -> None:
+        # 1. Import-time functions outside root __init__.py -> full importers
+        imp_cases = [
+            ("imp_init_sub", "sqlglot/expressions/core.py", "cls.key = cls.__name__.lower()", "cls.key = 'bad'"),
+            ("imp_simplify", "sqlglot/optimizer/simplify.py", "return decorator", "return None"),
+            ("imp_transforms", "sqlglot/transforms.py", "return _to_sql", "return None"),
+        ]
+        for cid, rel, a, b in imp_cases:
+            old = self._base_text(rel)
+            self.assertIn(a, old)
+            patch = _make_unified_diff(rel, old, old.replace(a, b, 1))
+            flat = self._validate_line(cid, self.selector.select_and_pack(cid, patch))
+            self.assertEqual(len(flat), len(self.tests_list), f"{cid} must select all importers")
+
+        # 2. Return annotation edits in files WITHOUT `from __future__ import annotations`
+        for cid, rel, old_sig, new_sig, min_tests in [
+            ("nf_trie", "sqlglot/trie.py", ") -> dict:", ") -> NonExistentXYZ:", len(self.tests_list)),
+            ("nf_env", "sqlglot/executor/env.py", "def sql_not(value):", "def sql_not(value) -> NonExistentXYZ:", 50),
+        ]:
+            old = self._base_text(rel)
+            self.assertIn(old_sig, old)
+            patch = _make_unified_diff(rel, old, old.replace(old_sig, new_sig, 1))
+            flat = self._validate_line(cid, self.selector.select_and_pack(cid, patch))
+            self.assertGreaterEqual(len(flat), min_tests, f"{cid} missed import-time annotation crash")
+
+    def test_lazy_importers_metaclass_attrs_and_non_expr_enum(self) -> None:
+        id_to_num = {t["id"]: t["number"] for t in self.tests_list}
+        athena_num = id_to_num["tests/dialects/test_athena.py::TestAthena::test_athena"]
+        jinja_num = id_to_num["tests/test_tokens.py::TestTokens::test_jinja"]
+        sf_replace = id_to_num["tests/dialects/test_snowflake.py::TestSnowflake::test_replace"]
+
+        # 1. Syntax error in lazily-imported typing/bigquery.py must include test_athena.py (via test_dialect.py)
+        bq_t = self._base_text("sqlglot/typing/bigquery.py")
+        p_bqt = _make_unified_diff(
+            "sqlglot/typing/bigquery.py",
+            bq_t,
+            bq_t.replace('returns": exp.DType.', 'returns": exp.DType.UNKNOWN, # ', 1),
+        )
+        self.assertIn(athena_num, self._validate_line("bqt", self.selector.select_and_pack("bqt", p_bqt)))
+
+        # 2. Class header base swap on DuckDB must include test_athena.py
+        duck = self._base_text("sqlglot/dialects/duckdb.py")
+        p_duck = _make_unified_diff("sqlglot/dialects/duckdb.py", duck, duck.replace("class DuckDB(Dialect):", "class DuckDB(MySQL):", 1))
+        self.assertIn(athena_num, self._validate_line("duck_swap", self.selector.select_and_pack("duck_swap", p_duck)))
+
+        # 3. BigQuery.Tokenizer.QUOTES (metaclass-compiled + direct subclass ref) includes test_jinja & test_replace
+        bq = self._base_text("sqlglot/dialects/bigquery.py")
+        p_bqq = _make_unified_diff(
+            "sqlglot/dialects/bigquery.py",
+            bq,
+            bq.replace("QUOTES = [\"'\", '\"', '\"\"\"', \"'''\"]", "QUOTES = ['ZZZ', '\"']", 1),
+        )
+        sel_bqq = set(self._validate_line("bqq", self.selector.select_and_pack("bqq", p_bqq)))
+        self.assertIn(jinja_num, sel_bqq)
+        self.assertIn(sf_replace, sel_bqq)
+
+        # 4. Non-Expr Enum in sqlglot/expressions/datatypes.py (DType) + import-time Expr (Select) + base Parser table
+        dt_src = self._base_text("sqlglot/expressions/datatypes.py")
+        p_dt = _make_unified_diff("sqlglot/expressions/datatypes.py", dt_src, dt_src.replace("BIGINT = auto()", 'BIGINT = "BAD"', 1))
+        self.assertEqual(len(self._validate_line("dtype", self.selector.select_and_pack("dtype", p_dt))), len(self.tests_list))
+
+        q_src = self._base_text("sqlglot/expressions/query.py")
+        p_sel = _make_unified_diff("sqlglot/expressions/query.py", q_src, q_src.replace('"with_": False,', '"with_": True,', 1))
+        self.assertEqual(len(self._validate_line("sel_arg", self.selector.select_and_pack("sel_arg", p_sel))), len(self.tests_list))
+
+        par_src = self._base_text("sqlglot/parser.py")
+        p_un = _make_unified_diff(
+            "sqlglot/parser.py",
+            par_src,
+            par_src.replace("        TokenType.NOT: lambda self: self.expression(exp.Not(this=self._parse_equality())),\n", "", 1),
+        )
+        self.assertEqual(len(self._validate_line("unary", self.selector.select_and_pack("unary", p_un))), len(self.tests_list))
+
+    def test_corrupt_profiles_graceful_fallback(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            bad_p = Path(td) / "corrupt_profiles.pkl.gz"
+            bad_p.write_bytes(b"NOT_VALID_ZLIB_PICKLE_DATA\x00\xff")
+            md = sel.load_map(ROOT / "map.pkl.gz", profiles_path=bad_p)
+            self.assertNotIn("expr_profiles", md)
+            s = sel.BlastRadiusSelector(md, self.tests_list)
+            p = "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1,1 +1,2 @@\n # x\n+y\n"
+            self.assertEqual(s.select_and_pack("corrupt_prof_ok", p)["workers"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

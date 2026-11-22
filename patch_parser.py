@@ -330,11 +330,18 @@ def _compute_hunk_changed_lines(h: Hunk) -> None:
                 idx += 1
             next_is_minus = idx < n and h.lines[idx].startswith("-")
             if not prev_was_minus and not next_is_minus:
-                # Pure insertion right before `old_ln` (after `old_ln - 1`)
-                if old_ln > 1:
-                    insertion_anchors.append(old_ln - 1)
-                if old_ln >= 1:
-                    insertion_anchors.append(old_ln)
+                if h.old_count == 0:
+                    # In unified diff -U0 pure insertions (`@@ -N,0 +M,K @@`), old_ln is the
+                    # 1-based line AFTER which lines are inserted (0 means before line 1).
+                    if old_ln >= 1:
+                        insertion_anchors.append(old_ln)
+                    insertion_anchors.append(old_ln + 1)
+                else:
+                    # Pure insertion right before `old_ln` (after `old_ln - 1`)
+                    if old_ln > 1:
+                        insertion_anchors.append(old_ln - 1)
+                    if old_ln >= 1:
+                        insertion_anchors.append(old_ln)
         else:
             idx += 1
 
@@ -372,8 +379,11 @@ def apply_hunks(base_bytes: bytes, hunks: list[Hunk]) -> bytes | None:
     new_trailing_nl = had_trailing_nl
 
     for h in hunks:
-        # 1-based old_start -> 0-based index (note: old_start==0 for empty base file)
-        target_idx = max(0, h.old_start - 1)
+        # In unified diff format, when old_count == 0 (pure insertion hunk, e.g. `@@ -44,0 +45 @@`
+        # or `@@ -0,0 +1 @@`), old_start is the 1-based line AFTER which new lines are inserted
+        # (so 0-based insertion index is `h.old_start`). Otherwise old_start is the 1-based first
+        # old line in the hunk (`h.old_start - 1`).
+        target_idx = h.old_start if h.old_count == 0 else max(0, h.old_start - 1)
         if target_idx < cursor or target_idx > len(old_lines):
             return None
         new_lines.extend(old_lines[cursor:target_idx])

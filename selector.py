@@ -240,9 +240,13 @@ class BlastRadiusSelector:
 
         # Precompute reverse index: identifier name -> bitset of tests executing
         # any function in sqlglot/ that references that name
-        self._name_ref_tests_cache: dict[str, int] = {}
+        self._name_ref_tests_cache: dict[Any, int] = {}
         self._name_to_locations: dict[str, list[tuple[str, str]]] = {}
         self._all_referenced_names: set[str] | None = None
+        self._lazy_importers_ready: bool = False
+        self._metaclass_compiled_attrs: set[str] | None = None
+        self._augmented_module_importers: dict[str, set[str]] | None = None
+        self._test_name_refs_cache: dict[str, int] | None = None
         for rel, info in self.ast_index.items():
             if not rel.startswith("sqlglot/"):
                 continue
@@ -387,11 +391,33 @@ class BlastRadiusSelector:
         return any(s <= lineno <= e for s, e in self._lambda_spans_cache[rel])
 
     @staticmethod
-    def _func_scope_signature(node: ast.AST) -> tuple[str, str, str | None, frozenset[str], bool]:
+    def _has_future_annotations(tree: ast.AST | None) -> bool:
+        """Return True iff the module activates `from __future__ import annotations`."""
+        if not isinstance(tree, ast.Module):
+            return False
+        for st in tree.body:
+            if isinstance(st, ast.ImportFrom) and st.module == "__future__":
+                if any(a.name == "annotations" for a in st.names):
+                    return True
+            elif not (
+                isinstance(st, ast.Expr)
+                and isinstance(st.value, ast.Constant)
+                and isinstance(st.value.value, str)
+            ):
+                # __future__ imports must precede non-docstring statements
+                break
+        return False
+
+    @staticmethod
+    def _func_scope_signature(node: ast.AST) -> tuple[str, str, str, str, str | None, frozenset[str], bool]:
         """Extract compile-time properties of a function that affect the whole body:
-        arguments/defaults, decorators, docstring, locally bound names, and yield flag."""
+        arguments/defaults, return annotation, type params, decorators, docstring,
+        locally bound names, and yield flag."""
         assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         args_dump = ast.dump(node.args, include_attributes=False)
+        ret_dump = ast.dump(node.returns, include_attributes=False) if node.returns is not None else ""
+        tp_nodes = getattr(node, "type_params", ())
+        tp_dump = "|".join(ast.dump(tp, include_attributes=False) for tp in tp_nodes) if tp_nodes else ""
         decs_dump = "|".join(ast.dump(d, include_attributes=False) for d in node.decorator_list)
         doc = ast.get_docstring(node, clean=False)
         bound: set[str] = set()
@@ -418,7 +444,7 @@ class BlastRadiusSelector:
                 for a in cur.names:
                     bound.add(a.asname or a.name.split(".")[0])
             stack.extend(ast.iter_child_nodes(cur))
-        return (args_dump, decs_dump, doc, frozenset(bound), has_yield)
+        return (args_dump, ret_dump, tp_dump, decs_dump, doc, frozenset(bound), has_yield)
 
     def _func_scope_changed(self, rel: str, fq: str, new_tree: ast.AST | None) -> bool:
         """Return True if signature, decorators, local bindings, or yield-ness changed."""
@@ -546,12 +572,128 @@ class BlastRadiusSelector:
         self._name_ref_tests_cache[cache_key] = bits
         return bits
 
+    def _is_metaclass_compiled_attr(self, attr_name: str) -> bool:
+        """Return True iff `attr_name` is read in a class-creation hook (`__new__` or
+        `__init_subclass__`), meaning runtime code may read derived compiled attributes
+        rather than `attr_name` directly."""
+        if self._metaclass_compiled_attrs is None:
+            compiled: set[str] = set()
+            for nm, locs in self._name_to_locations.items():
+                if any(qn.endswith((".__init_subclass__", ".__new__")) for _, qn in locs):
+                    compiled.add(nm)
+            self._metaclass_compiled_attrs = compiled
+        return attr_name in self._metaclass_compiled_attrs
+
+    def _is_import_time_referenced_name(self, name: str, *, also_lower: bool = False) -> bool:
+        """Return True iff `name` (or its lowercase variant) is referenced inside any
+        function recorded in `import_time_funcs`."""
+        if not self.import_time_funcs:
+            return False
+        names = (name, name.lower()) if (also_lower and name.isupper() and name.lower() != name) else (name,)
+        for nm in names:
+            for loc_rel, qn in self._name_to_locations.get(nm, ()):
+                if qn in self.import_time_funcs.get(loc_rel, ()):
+                    return True
+        return False
+
+    def _ensure_lazy_importers(self) -> dict[str, set[str]]:
+        """Augment static `module_importers` with PEP 562 `__getattr__` lazy-import edges
+        (e.g., `from sqlglot.dialects import BigQuery` in `tests/dialects/test_dialect.py`
+        transitively imports `sqlglot.dialects.bigquery`, `sqlglot.typing.bigquery`, etc.)."""
+        if self._augmented_module_importers is not None:
+            return self._augmented_module_importers
+
+        aug: dict[str, set[str]] = {m: set(v) for m, v in self.module_importers.items()}
+
+        # 1. Extract lazy attribute -> target submodule mappings from PEP 562 packages
+        lazy_pkg_maps: dict[str, dict[str, str]] = {}
+
+        d_tree = self._get_module_ast("sqlglot.dialects")
+        if isinstance(d_tree, ast.Module):
+            dmap: dict[str, str] = {
+                "Dialect": "sqlglot.dialects.dialect",
+                "Dialects": "sqlglot.dialects.dialect",
+            }
+            for st in d_tree.body:
+                if (
+                    isinstance(st, ast.Assign)
+                    and len(st.targets) == 1
+                    and isinstance(st.targets[0], ast.Name)
+                    and st.targets[0].id == "DIALECTS"
+                    and isinstance(st.value, (ast.List, ast.Tuple))
+                ):
+                    for elt in st.value.elts:
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                            dmap[elt.value] = f"sqlglot.dialects.{elt.value.lower()}"
+            lazy_pkg_maps["sqlglot.dialects"] = dmap
+
+        o_tree = self._get_module_ast("sqlglot.optimizer")
+        if isinstance(o_tree, ast.Module):
+            omap: dict[str, str] = {}
+            for st in o_tree.body:
+                val = None
+                if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) and st.targets[0].id == "_LAZY_ATTRS":
+                    val = st.value
+                elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.target.id == "_LAZY_ATTRS":
+                    val = st.value
+                if isinstance(val, ast.Dict):
+                    for k, v in zip(val.keys, val.values):
+                        if (
+                            isinstance(k, ast.Constant)
+                            and isinstance(k.value, str)
+                            and isinstance(v, ast.Tuple)
+                            and v.elts
+                            and isinstance(v.elts[0], ast.Constant)
+                            and isinstance(v.elts[0].value, str)
+                        ):
+                            omap[k.value] = v.elts[0].value
+            lazy_pkg_maps["sqlglot.optimizer"] = omap
+
+        # 2. Discover direct lazy `from <pkg> import <attr>` edges in modules importing <pkg>
+        new_edges: list[tuple[str, str]] = []  # (importer_mod, target_mod)
+        for pkg, amap in lazy_pkg_maps.items():
+            for imp_mod in list(aug.get(pkg, ())):
+                itree = self._get_module_ast(imp_mod)
+                if not isinstance(itree, ast.Module):
+                    continue
+                for st in itree.body:
+                    if isinstance(st, ast.ImportFrom) and st.module == pkg and st.level == 0:
+                        for alias in st.names:
+                            if alias.name == "*":
+                                for tm in amap.values():
+                                    new_edges.append((imp_mod, tm))
+                            elif alias.name in amap:
+                                new_edges.append((imp_mod, amap[alias.name]))
+                            else:
+                                cand_sub = f"{pkg}.{alias.name}"
+                                if cand_sub in self.module_to_file:
+                                    new_edges.append((imp_mod, cand_sub))
+
+        if new_edges:
+            # Build reverse dependency index: mod -> all modules `dep` such that `mod` imports `dep`
+            imports_of: dict[str, set[str]] = {}
+            for dep, imps in aug.items():
+                for im in imps:
+                    imports_of.setdefault(im, set()).add(dep)
+
+            for imp_mod, target_mod in new_edges:
+                # Everyone who imports imp_mod (plus imp_mod itself) now transitively imports
+                # target_mod and everything target_mod transitively imports.
+                upstream = {imp_mod} | aug.get(imp_mod, set())
+                downstream = {target_mod} | imports_of.get(target_mod, set())
+                for dep in downstream:
+                    aug.setdefault(dep, set()).update(upstream)
+
+        self._augmented_module_importers = aug
+        return aug
+
     def _importer_tests(self, rel: str) -> int:
         """All tests in files that transitively import `rel` (plus direct exec/dialect tests)."""
         bits = self.module_exec_tests.get(rel, 0) | self.dialect_to_tests.get(rel, 0)
         mod = self.file_to_module.get(rel)
         if mod:
-            for imp_mod in self.module_importers.get(mod, ()):
+            importers_map = self._ensure_lazy_importers()
+            for imp_mod in importers_map.get(mod, ()):
                 imp_rel = self.module_to_file.get(imp_mod)
                 if not imp_rel:
                     continue
@@ -562,15 +704,45 @@ class BlastRadiusSelector:
                     bits |= self.dialect_to_tests.get(imp_rel, 0)
         return bits
 
+    def _test_method_refs_for_name(self, name: str) -> int:
+        """All test methods in `tests/` whose AST statically references `name`
+        (catches direct subclass instantiation such as `BigQuery.Tokenizer()`
+        in `tests/test_tokens.py::TestTokens::test_jinja` that bypasses
+        `Dialect.get_or_raise`)."""
+        if self._test_name_refs_cache is None:
+            cache: dict[str, int] = {}
+            for tref, info in self.ast_index.items():
+                if not tref.startswith("tests/"):
+                    continue
+                mbits = self._test_method_bits.get(tref)
+                if not mbits:
+                    continue
+                for nm, qns in info.get("names_referenced_by", {}).items():
+                    matched = 0
+                    for qn in qns:
+                        if qn in mbits:
+                            matched |= mbits[qn]
+                    if matched:
+                        cache[nm] = cache.get(nm, 0) | matched
+            self._test_name_refs_cache = cache
+        return self._test_name_refs_cache.get(name, 0)
+
     def _subclass_dialect_tests(self, rel: str, cls_qname: str) -> int:
         """Dialect & class tests for cls_qname and all its transitive subclasses."""
+        _GENERIC_BASE_NAMES = frozenset({"Dialect", "Tokenizer", "Parser", "Generator", "Expr", "_TokenizerBase"})
         bits = self.dialect_to_tests.get(rel, 0)
         bits |= self.class_to_tests.get(rel, {}).get(cls_qname, 0)
+        top = cls_qname.split(".", 1)[0]
+        if top and top not in _GENERIC_BASE_NAMES:
+            bits |= self._test_method_refs_for_name(top)
         cls_id = f"{rel}:{cls_qname}"
         for sub_id in self.class_subclasses.get(cls_id, ()):
             sub_rel, sub_q = sub_id.split(":", 1)
             bits |= self.dialect_to_tests.get(sub_rel, 0)
             bits |= self.class_to_tests.get(sub_rel, {}).get(sub_q, 0)
+            sub_top = sub_q.split(".", 1)[0]
+            if sub_top and sub_top not in _GENERIC_BASE_NAMES:
+                bits |= self._test_method_refs_for_name(sub_top)
         return bits
 
     def _expr_hierarchy_tests(self, rel: str, cls_qname: str) -> int:
@@ -781,11 +953,9 @@ class BlastRadiusSelector:
 
         # 5. Class header / base / metaclass changes -> full class + subclass + importers
         for cq in ana.changed_class_headers:
-            bits = self._subclass_dialect_tests(rel, cq)
+            bits = self._subclass_dialect_tests(rel, cq) | self._importer_tests(rel)
             if rel.startswith("sqlglot/expressions/"):
                 bits |= self._expr_hierarchy_tests(rel, cq)
-            if not bits:
-                bits = self._importer_tests(rel)
             self._add_prob(probs, bits if bits else self.all_map_bits, cfg["p_direct"])
 
         # 6. Function / method body changes
@@ -797,10 +967,20 @@ class BlastRadiusSelector:
         if ana.old_tree is not None and (ana.changed_funcs or ana.changed_class_attrs):
             self._ensure_ast_caches(rel, pre_parsed=ana.old_tree)
         new_tree = ana.new_tree
+        has_future_ann = self._has_future_annotations(new_tree)
+        imp_fns = self.import_time_funcs.get(rel, ())
 
         any_scope_changed = False
         for fq in ana.changed_funcs:
             if fq in safe_added_public_funcs:
+                continue
+            # Any function recorded as running during module import (metaclasses,
+            # __init_subclass__, decorator factories, import-time parse helpers) can
+            # fail every module importer at collection/import time.
+            if fq in imp_fns:
+                imp_bits = self._importer_tests(rel)
+                self._add_prob(probs, imp_bits if imp_bits else self.all_map_bits, cfg["p_direct"])
+                any_scope_changed = True
                 continue
             ftests = file_fmap.get(fq, 0)
             span = func_spans.get(fq)
@@ -826,6 +1006,14 @@ class BlastRadiusSelector:
                         enclosing_stmt_bits |= file_lmap.get(sln, 0)
 
             if scope_changed:
+                # Without `from __future__ import annotations`, parameter and return
+                # annotations are evaluated at import/definition time, so a broken
+                # annotation fails all importers of this module at import time.
+                if not has_future_ann:
+                    imp_bits = self._importer_tests(rel)
+                    self._add_prob(probs, imp_bits if imp_bits else self.all_map_bits, cfg["p_direct"])
+                    continue
+
                 # Signature, decorator, local variable binding, or yield-ness changed:
                 # whole function must be treated as directly impacted — EXCEPT Phase 4c:
                 # if ONLY pure default argument value(s) changed on a profiled undecorated
@@ -911,6 +1099,18 @@ class BlastRadiusSelector:
         # 7. Class attribute / declarative table changes (e.g. FUNCTIONS, SHOW_PARSERS,
         #    NUMERIC_ESCAPES, WEEK_OFFSET, arg_types, TRANSFORMS, KEYWORDS)
         for cq, attr_name, dkeys, dict_values_only in ana.changed_class_attrs:
+            # Base-class tables in core tokenizer/parser/generator/dialect that are read by
+            # import-time functions can break module importers during test collection before
+            # per-test line or mapping profiling runs (even when the entry value is a lambda!).
+            is_base_imp_table = (
+                rel in ("sqlglot/tokens.py", "sqlglot/parser.py", "sqlglot/generator.py", "sqlglot/dialects/dialect.py")
+                and self._is_import_time_referenced_name(attr_name, also_lower=True)
+            )
+            if is_base_imp_table:
+                imp_bits = self._importer_tests(rel)
+                self._add_prob(probs, imp_bits if imp_bits else self.all_map_bits, cfg["p_direct"])
+                continue
+
             # Only treat direct line coverage as a runtime hit when the changed line is
             # inside a lambda (avoiding accidental lazy-import first-test hits on class bodies!)
             direct_attr_lines = 0
@@ -925,9 +1125,20 @@ class BlastRadiusSelector:
                     self._add_prob(probs, dial_bits, cfg["p_dialect_attr_fallback"])
                 continue
 
-            # Expression class attribute (e.g. TriggerProperties.arg_types)
+            # Expression module class attribute (e.g. TriggerProperties.arg_types vs DType Enum)
             if rel.startswith("sqlglot/expressions/"):
+                short_cls = cq.split(".")[-1]
+                if short_cls not in self.expr_class_file and short_cls != "Expr":
+                    # Non-Expr class inside sqlglot/expressions/ (e.g. DType Enum):
+                    # enum members feed class-body dicts at import time -> all importers.
+                    imp_bits = self._importer_tests(rel)
+                    self._add_prob(probs, imp_bits if imp_bits else self.all_map_bits, cfg["p_direct"])
+                    continue
                 ebits = self._expr_hierarchy_tests(rel, cq)
+                # Expr classes constructed by import-time parsers/helpers (e.g. Select) can
+                # fail importers during collection if arg_types/required_args change.
+                if self._is_import_time_referenced_name(short_cls):
+                    ebits |= self._importer_tests(rel)
                 if ebits:
                     self._add_prob(probs, ebits, cfg["p_expr_attr"])
                     # Also include cheap typing/expression metadata checks
@@ -954,6 +1165,10 @@ class BlastRadiusSelector:
                 dict_values_only=dict_values_only,
                 also_lower=True,
             )
+            # Attributes read by __new__ / __init_subclass__ (e.g. QUOTES, IDENTIFIERS,
+            # SINGLE_TOKENS, COMMENTS) are compiled into derived attributes at class creation,
+            # so intersecting `dial_bits & ref_bits` is unsound for them.
+            is_meta_attr = self._is_metaclass_compiled_attr(attr_name)
 
             # If dict keys are Expr class names (e.g. TRANSFORMS = {exp.Foo: ...}),
             # we can intersect even more tightly with expr_to_tests!
@@ -975,7 +1190,7 @@ class BlastRadiusSelector:
                 if expr_key_bits and (dial_bits & expr_key_bits):
                     primary_bits, primary_p = dial_bits & expr_key_bits, cfg["p_dialect_attr_intersect"]
                     fallback_bits, fallback_p = dial_bits, cfg["p_dialect_attr_fallback"]
-                elif ref_bits and (dial_bits & ref_bits):
+                elif not is_meta_attr and ref_bits and (dial_bits & ref_bits):
                     primary_bits, primary_p = dial_bits & ref_bits, cfg["p_dialect_attr_intersect"]
                     fallback_bits, fallback_p = dial_bits, cfg["p_dialect_attr_fallback"]
                 else:
@@ -1521,9 +1736,18 @@ def load_map(
             if cand.is_file():
                 profiles_path = cand
     if profiles_path is not None and profiles_path.is_file():
-        prof_data = pickle.loads(zlib.decompress(profiles_path.read_bytes()))
+        try:
+            prof_data = pickle.loads(zlib.decompress(profiles_path.read_bytes()))
+            if not isinstance(prof_data, dict):
+                raise ValueError(f"Expected dict in profiles, got {type(prof_data).__name__}")
+        except Exception as exc:
+            print(
+                f"[selector] WARNING: ignoring unreadable profiles {profiles_path}: {exc!r}",
+                file=sys.stderr,
+            )
+            prof_data = None
         # Verify profile commit matches map commit (conservative: ignore on mismatch)
-        if prof_data.get("commit") == data.get("commit") and prof_data.get("test_ids") == data.get("test_ids"):
+        if prof_data is not None and prof_data.get("commit") == data.get("commit") and prof_data.get("test_ids") == data.get("test_ids"):
             for k in (
                 "expr_profiles",
                 "reach_profiles",
@@ -1537,7 +1761,7 @@ def load_map(
             ):
                 if k in prof_data:
                     data[k] = prof_data[k]
-        elif "expr_profiles" in prof_data and "test_ids" not in prof_data and prof_data.get("commit") == data.get("commit"):
+        elif prof_data is not None and "expr_profiles" in prof_data and "test_ids" not in prof_data and prof_data.get("commit") == data.get("commit"):
             for k in (
                 "expr_profiles",
                 "reach_profiles",
