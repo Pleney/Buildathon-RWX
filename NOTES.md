@@ -335,5 +335,3 @@ Measured against the static + dict-values baseline (`profiles=OFF, verifier=off`
 
 See `MORNING_REPORT.md` and `CANDIDATES.md` for full per-family breakdown, repo size audit, and recommended submission order.
 
-- **DIAGNOSTIC PROBE (not a candidate)**: Temporarily drops the 5 heaviest tests (`test_max_nodes`, `test_execute_tpcds`, `test_generator_memory`, `test_execute_tpch`, `test_optimized_tpch`) right before packing to measure heavy-test waste on practice (immediately reverted in the next commit).
-
