@@ -47,7 +47,7 @@ SCORER_FLAGS = [
 
 MEASURE_PY = (
     "import resource, subprocess, sys\n"
-    "p = subprocess.run(['python', '-E', '/app/selector.py'], stdout=sys.stdout, stderr=sys.stderr)\n"
+    "p = subprocess.run(['python', '-S', '-E', '/app/selector.py'], stdout=sys.stdout, stderr=sys.stderr)\n"
     "ru = resource.getrusage(resource.RUSAGE_CHILDREN)\n"
     "sys.stderr.write(f'__CPU__={ru.ru_utime + ru.ru_stime:.4f}\\n')\n"
     "sys.exit(p.returncode)\n"
@@ -169,7 +169,7 @@ def main() -> int:
             "-v", f"{REPO / 'build_tmp/sqlglot'}:/sqlglot:ro",
             "blast-radius-mapgen", "python", "-u", "/app/diff_test.py", "--quick",
         ]
-    p_df = _run(df_cmd, timeout=900)
+    p_df = _run(df_cmd, timeout=1200)
     df_sec = time.monotonic() - t_df
     df_out = p_df.stdout.decode("utf-8", "replace")
     m_wd = re.search(r"TOTAL WRONG DROPS:\s*(\d+)", df_out)

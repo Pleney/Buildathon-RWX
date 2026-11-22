@@ -307,7 +307,31 @@ Measured against the static + dict-values baseline (`profiles=OFF, verifier=off`
   - Robustness suite (`tests/test_robustness.py`): **18/18 passed** under `python -S -E`.
   - Compliance audit: **0** sample commit IDs in any tracked file.
 
+---
 
+## Overnight Phases 1–6 (`work` -> `main`): Sound Profile Extensions, Broader Evaluation & Slim Container
 
+### Practice Board Context
+- `2a3d3cb` (P1–P6 expr profiles, `verifier=off`) scored **200.8 s** on hidden practice (`199.5 s` simulated + `1.25 s` CPU, **0 misses**), vs `206.7 s` for v1 static (`-5.9 s`).
+- To stop overfitting to the 30 samples, all overnight work was gated by `gate.sh` (6 automated checks), evaluated on a 20% deterministic hold-out plus a brand-new 76-edit / 9-family broader evaluation suite (`0` edits seen during development), and implemented strictly by construction from pinned commit `eb11aec`.
 
+### Key Architectural & Soundness Additions
+- **Split artifacts & 2x stability builds**: Frozen `map.pkl.gz` (`2.24 MB`) + stability-verified `profiles.pkl.gz` (`0.71 MB`; total `2.95 MB <= 6 MB`). Every build runs the full suite twice in plain single-process `pytest` order and drops any site/table that differs across runs.
+- **Phase 1 (`5a84dfc`, `BLAST_P1_REACH`, `BLAST_P1_MULTISITE`, `BLAST_P1_ROOT_INIT`)**: Sub-expression reachability (`__blast_rm__`, 6,042 sites), per-file multi-site conjunction via First-Divergence Induction, `sqlglot/__init__.py` non-import-time function scoping (`import_time_funcs`), 4-tuple AST spans `(lineno, col, end_lineno, end_col)`, and re-entrancy-guarded `compare_probe` (37x faster profiling).
+- **Phase 2 (`aa9dec4`, `BLAST_P2_MAPPINGS`)**: Per-test mapping-key lookup profiles (`mapping_profiler.py`) across `Dialect`/`Tokenizer`/`Parser`/`Generator` class-level dict tables + `Generator._dispatch` -> `TRANSFORMS` (`461/461` tables 100% stable). Handles key-derived tries/sets, `TIME_MAPPING`/`INVERSE_TIME_MAPPING` shared aliases, AST-verified pure closure-factory values, and import-time cross-key subscripts.
+- **Phase 3 (`cbb9984`, `BLAST_P3_EQUIV`)**: Code-only commit-level equivalence in `patch_parser.py` & `selector.py`: alpha-equivalent local variable renames, docstring-only narrowing (keeping `tests/test_docs.py`), and unreferenced import-time-pure added top-level public functions (narrowed to 8 meta/docs tests). Expanded `tests/test_robustness.py` to 20 tests.
+- **Phase 4 (`401eab5`, `BLAST_P4_RANGES`)**: Ordered-comparison integer delta ranges P7 (`235/235` stable), bounded constant-equality value sets P8 (`643/644` stable, 1 unstable auto-dropped), and default-argument omission profiles P9 (`599/599` stable, with Python 3.13 `inspect.getfullargspec` unwrap).
+- **Phase 6 (Slim `Dockerfile`)**: Removed unused `requirements.lock` pip install and `/sqlglot` download from the runtime image (`CMD ["python", "-S", "-E", "/app/selector.py"]`), dropping no-cache Docker build time from **`42.8 s` to `1.4 s`** with zero external network fetches during judge builds. `BLAST_VERIFIER_MODE` remains `off` by default; shadow & Laplace pruning remain `False`.
+
+### Per-Phase Ablation Across All Benchmarks (`BLAST_VERIFIER_MODE=off`, **0 Misses Everywhere**)
+| Config | 30 Real Samples (Oracle `94.351 s`) | Orig 126 Synth (Oracle `258.60 s`) | New 76 Phase-5 Edits (Oracle `103.74 s`) | Combined 41 Hold-Out (Oracle `35.10 s`) | Misses |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `0_Static` (profiles OFF) | 162.412 s | 695.20 s | 637.44 s | 243.94 s | 0 |
+| `1_Base` (`2a3d3cb`, P1–P6) | 109.635 s | 533.73 s | 637.44 s | 227.43 s | 0 |
+| `2_+Phase1` (`5a84dfc`) | 109.635 s | 427.67 s | 632.44 s | 218.34 s | 0 |
+| `3_+Phase2` (`aa9dec4`) | **101.564 s** | 421.75 s | 569.22 s | 203.11 s | 0 |
+| `4_+Phase3` (`cbb9984`) | **101.564 s** | 421.75 s | 420.79 s | 151.33 s | 0 |
+| `5_+Phase4` (`401eab5` / Slim) | **101.564 s** | **421.60 s** | **377.75 s** | **143.22 s** | **0** |
+
+See `MORNING_REPORT.md` and `CANDIDATES.md` for full per-family breakdown, repo size audit, and recommended submission order.
 
